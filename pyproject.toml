@@ -1,0 +1,30 @@
+[project]
+name = "honobono"
+version = "0.1.0"
+description = "Story summarization and character / concept extraction"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = ["llama-cpp-python==0.3.22"]
+
+[dependency-groups]
+dev = ["ruff>=0.6", "pyright>=1.1"]
+
+[[tool.uv.index]]
+name = "llama-cpp-metal"
+url = "https://abetlen.github.io/llama-cpp-python/whl/metal"
+explicit = true
+
+[tool.uv.sources]
+llama-cpp-python = { index = "llama-cpp-metal" }
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "N"]
+# C408: dict(kw=val) is fine for ctx = dict(**ctx) patterns used as kwargs spreads.
+ignore = ["C408"]
+
+[tool.ruff.lint.per-file-ignores]
+# Japanese prompt strings: ruff counts codepoints, not display-cell width.
+"tools/prompts.py" = ["E501"]

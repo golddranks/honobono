@@ -1,0 +1,59 @@
+char_extract
+- picks up non-character entities
+- picks up entities that don't refer to single, specific character
+
+char_extract_verify
+- detects a hallucination, but only crashes
+
+char_merge_eval
+- flags the best candidate as "unlikely"
+
+char_merge_judge
+- judges multiple candidates as true
+- judges the an existing character and the "new" option both true
+
+char_merge_prune_candidates
+- keeps a character even if it has existing matches
+
+char_merge_judge / char_update_reg_b
+- allows multiple characters to be merged as the same
+
+registry invariants
+- duplicate canonical_names across registry entries silently lose data
+  (render_registry, _cname_to_id, and the merge_eval/judge/extract_verify
+  schemas all key on canonical_name; second occurrence overwrites first).
+  Needs detection + fix step.
+
+char_extract / char_extract_verify interaction
+- verify prompt doesn't reproduce extract's "人間・人型存在・人格を持つ存在のみ"
+  rule. If extract correctly omits an animal/monster/object, verify can
+  flag it as `missing` and the pipeline crashes. Either copy the rule into
+  verify or have verify accept extract's exclusion rationale.
+
+char_extract output
+- CHAR_EXTRACT_SCHEMA doesn't enforce uniqueness of canonical_name. Two
+  items with the same cname collapse silently in pipeline.py's per-name
+  dicts (evals/judges/prunes keyed by cname). Same family as the registry
+  duplicate-cname problem above.
+
+char_extract canonical_name source
+- for ep2+, the registry is in the prompt context. A model can pick a
+  canonical_name from <既存の人物> instead of the form actually used in
+  <本文>, breaking the assumption that names[*].canonical_name is a
+  surface form found in the current body. Add an explicit "本文に現れる
+  呼び方の中から選ぶ。既存の人物の名前を流用しない" rule.
+
+prompt / schema length limits diverge
+- consolidate prompt says description 150文字, schema allows 500.
+- update_history says new_history 80文字, schema allows 200.
+- summarize says 100文字, schema allows 300.
+  The prompt is what the model actually follows, so the schema slack is
+  effectively dead margin. Either align numbers or document why the schema
+  is intentionally looser.
+
+char_consolidate prompt structure
+- the 整理対象 block is nested JSON ({id, current: {...},
+  new_surface_forms_this_episode: [...]}) while every other per-target
+  prompt uses flat semantic tags (<判定対象>, <対象人物>). Smaller models
+  parse nesting less reliably. Consider flattening to tag style for
+  consistency.

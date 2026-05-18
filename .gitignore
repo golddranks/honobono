@@ -1,0 +1,13 @@
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.venv
+semantic_summary
+semantic_summary*
+original_txt
+episodes
+models
+.ruff_cache
