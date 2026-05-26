@@ -9,8 +9,8 @@ from tools import common, fetch_episodes, fetch_model, pipeline
 sys.stdout.reconfigure(line_buffering=True)
 
 MODEL = "qwen3-4b"
-EPS = [3, 4, 5]
-RESUME_FROM: Path | None = Path("semantic_summary/2026-05-27_0207_Qwen3-4B-Q8_0")
+EPS = [5]
+RESUME_FROM: Path | None = Path("semantic_summary/2026-05-27_0346_Qwen3-4B-Q8_0")
 
 
 def main() -> None:

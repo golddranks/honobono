@@ -673,13 +673,18 @@ def char_merge_prune_prompt(
         same_name_rule = ""
     return f"""新規登録人物の妥当性判定。
 
-判定対象は今回新しく抽出された人物候補です。これが追跡する価値のある具体的な人物かを判断してください。
+判定対象は今回新しく抽出された人物候補です。これが追跡する価値のある具体的な人物か、
+それとも既存の人物の別呼称・別名なのかを判断してください。
 
 ルール:
-- 本文に登場する具体的な個人（固有・特定可能な存在）なら keep=true。
+- 本文に登場する具体的な個人（固有・特定可能な存在）で、<既存の人物> のいずれとも別人なら
+  keep=true、merge_into=null。
 - 一般化された群や役割の総称、本文内で語られる物語の中の登場人物、
-  一過性の言及で追跡する価値がないものは keep=false。
-- 既存の人物と重複する単なる別呼称が抽出ミスとして残った場合も keep=false。
+  一過性の言及で追跡する価値がないものは keep=false、merge_into=null。
+- 判定対象が <既存の人物> のうちある人物 X の別呼称・別名・本名・あだ名であり、
+  X と同一人物だと判断できる場合は keep=false、merge_into に X の canonical_name を書く。
+  （例: 本文で「タブロは父の名前」とあり、<既存の人物> に「父」が存在するなら merge_into="父"。
+   この場合、判定対象は「父」のエイリアスとして登録される。）
 {same_name_rule}- reason に短く根拠を述べる。
 {plot}{reg_block}{prev}{names_block}{same_name_block}
 <本文>
@@ -691,21 +696,34 @@ def char_merge_prune_prompt(
 
 JSONのみを出力すること。形式は以下のように。
 {{
-    "keep": true または false,
-    "reason": "判定の根拠"
+    "reason": "判定の根拠",
+    "merge_into": "既存の人物の canonical_name" または null,
+    "keep": true または false
 }}
 """
 
 
-MERGE_PRUNE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "keep": {"type": "boolean"},
-        "reason": {"type": "string", "maxLength": 500},
-    },
-    "required": ["keep", "reason"],
-    "additionalProperties": False,
-}
+def merge_prune_schema(existing_cnames: list[str]):
+    """Per-new-target keep/merge/drop verdict. `merge_into` is constrained
+    to an existing canonical_name (or null) so the model can't invent
+    targets. Field order is reason → merge_into → keep so the model
+    commits to the decision after writing the rationale (chain-of-thought
+    via field order)."""
+    return {
+        "type": "object",
+        "properties": {
+            "reason": {"type": "string", "maxLength": 500},
+            "merge_into": {
+                "oneOf": [
+                    {"type": "string", "enum": list(existing_cnames)},
+                    {"type": "null"},
+                ],
+            },
+            "keep": {"type": "boolean"},
+        },
+        "required": ["reason", "merge_into", "keep"],
+        "additionalProperties": False,
+    }
 
 
 # ---------------------------------------------------------------- consolidate

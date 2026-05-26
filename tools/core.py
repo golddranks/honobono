@@ -128,10 +128,34 @@ def char_extract_verify_semantics(
 
 
 def char_extract_verify_missing(*, episode_text: str, names: list[dict], model: str) -> Result:
-    """Single completeness check against episode_text only. Output: `{missing[], reason}`.
-    Non-empty missing → extract failed."""
+    """Single completeness check against episode_text only. Output:
+    `{episode_text_mentions[], missing[], reason, missing_llm[]}`.
+    Non-empty `missing` → extract failed.
+
+    The model's own `missing` field is unreliable on weak (4B/8B) runs:
+    the chain-of-thought ordering (enumerate `episode_text_mentions`
+    first, then derive `missing`) gets the enumeration right but the
+    model still defaults to `missing=[]` without actually computing the
+    diff. So `missing` is overridden post-LLM with a mechanical diff:
+    any 人物-categorized mention whose name isn't already in `names`
+    becomes missing. The model's original answer is preserved in
+    `missing_llm` for audit."""
     prompt = prompts.char_extract_verify_missing_prompt(episode_text=episode_text, names=names)
-    return _generate_parsed(prompt, model, prompts.VERIFY_MISSING_SCHEMA, num_predict=2000)
+    res = _generate_parsed(prompt, model, prompts.VERIFY_MISSING_SCHEMA, num_predict=2000)
+    extracted_cnames = {n["canonical_name"] for n in names}
+    mech_missing: list[str] = []
+    seen: set[str] = set()
+    for m in res.output.get("episode_text_mentions", []):
+        if m.get("category") != prompts.PERSON_CATEGORY:
+            continue
+        name = m.get("name", "")
+        if not name or name in extracted_cnames or name in seen:
+            continue
+        seen.add(name)
+        mech_missing.append(name)
+    res.output["missing_llm"] = res.output.get("missing", [])
+    res.output["missing"] = mech_missing
+    return res
 
 
 def char_extract_verify_quote(
@@ -514,7 +538,13 @@ def char_merge_prune(
     target_canonical_name: str,
     model: str,
 ) -> Result:
-    """Per-new-target keep/drop verdict. Output: `{keep: bool, reason}`."""
+    """Per-new-target keep/merge/drop verdict.
+    Output: `{reason, merge_into: str | null, keep: bool}`.
+    `merge_into` is constrained by schema to an existing canonical_name
+    (or null) — when keep=false but merge_into is set, update_reg_merge
+    treats the target as an alias of the named existing entry instead
+    of dropping it. This is the recovery path for cases where
+    merge_judge missed a name-reveal pattern."""
     target = _find_name(names, target_canonical_name)
     prompt = prompts.char_merge_prune_prompt(
         episode_text=episode_text,
@@ -525,7 +555,8 @@ def char_merge_prune(
         target_canonical_name=target_canonical_name,
         target_description=target.get("description", ""),
     )
-    return _generate_parsed(prompt, model, prompts.MERGE_PRUNE_SCHEMA, num_predict=1000)
+    schema = prompts.merge_prune_schema(_existing_cnames(registry))
+    return _generate_parsed(prompt, model, schema, num_predict=1000)
 
 
 def char_consolidate(
@@ -665,7 +696,11 @@ def update_reg_merge(
       ≥1 existing match (resolved, single after collapse):
         add surface forms to entry.aliases, append seq.
       0 existing matches (or none resolved):
-        prunings[cname].keep == false → drop. Else allocate a fresh id.
+        prunings[cname].keep == true                → allocate fresh id.
+        keep == false AND merge_into = <existing>   → add as alias of
+          that existing entry (prune-driven recovery from judge errors
+          on name-reveal patterns).
+        keep == false AND merge_into = null         → silent drop.
     """
     cname_to_id = _cname_to_id(registry)
     max_id = max((int(i) for i in registry), default=0)
@@ -676,13 +711,19 @@ def update_reg_merge(
         )
         resolved = [cname_to_id[c] for c in existing if c in cname_to_id]
         if not resolved:
-            if not prunings.get(cname, {}).get("keep", True):
+            prune = prunings.get(cname, {})
+            if prune.get("keep", True):
+                max_id = _allocate_entry(registry, item, seq, max_id)
+                cname_to_id[cname] = max_id
                 continue
-            max_id = _allocate_entry(registry, item, seq, max_id)
-            cname_to_id[cname] = max_id
-            continue
-        # `resolved` is guaranteed to have at most one entry after
-        # collapse_multi_judge — single match path only.
+            merge_target = prune.get("merge_into")
+            if merge_target and merge_target in cname_to_id:
+                resolved = [cname_to_id[merge_target]]
+            else:
+                continue  # silent drop
+        # `resolved` is guaranteed to have at most one entry — either
+        # from the judge path (single after collapse_multi_judge) or
+        # from the prune merge_into recovery path.
         cid = str(resolved[0])
         entry = registry[cid]
         for n in [cname, *(item.get("other_names") or [])]:
