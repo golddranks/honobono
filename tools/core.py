@@ -56,7 +56,10 @@ def char_extract(
     model: str,
 ) -> Result:
     """Extract the character list for one episode. Output: list of dicts
-    `[{canonical_name, other_names, description}, ...]`."""
+    `[{canonical_name, evidence_quote}, ...]`. evidence_quote is a literal
+    substring of `body` that refers to this character — verify_each
+    enforces it semantically and downstream stages use it as per-target
+    body context (in place of the old `description`)."""
     prompt = prompts.char_extract_prompt(
         body=body,
         prev_body=prev_body,
@@ -68,14 +71,36 @@ def char_extract(
     return res
 
 
-def char_extract_verify(*, body: str, names: list[dict], model: str) -> Result:
-    """Verify the extracted list for omissions and hallucinations against
-    the body only — no registry / prev_body / summaries are shown to the
-    model on purpose (so it can't accept those sources as evidence that an
-    extract entry is a real character in this ep). Output: `{complete,
-    hallucination, missing[], hallucinated[]}`."""
-    prompt = prompts.char_extract_verify_prompt(body=body, names=names)
-    return _generate_parsed(prompt, model, prompts.extract_verify_schema(names), num_predict=1000)
+def char_extract_verify_each(
+    *,
+    body: str,
+    target_canonical_name: str,
+    target_evidence_quote: str,
+    model: str,
+) -> Result:
+    """Per-extracted-name validity check against body only. Output:
+    `{in_body, is_person, is_single, reason}`. Any false → name is bad and
+    should fail the extract. Body-only by design (no registry / summaries /
+    prev_body) so the model can't accept those sources as evidence that an
+    entry is a real character in this ep."""
+    prompt = prompts.char_extract_verify_each_prompt(
+        body=body,
+        target_canonical_name=target_canonical_name,
+        target_evidence_quote=target_evidence_quote,
+    )
+    return _generate_parsed(prompt, model, prompts.VERIFY_EACH_SCHEMA, num_predict=500)
+
+
+def char_extract_verify_missing(*, body: str, names: list[dict], model: str) -> Result:
+    """Single body-only completeness check. Output: `{missing[], reason}`.
+    Non-empty missing → extract failed."""
+    prompt = prompts.char_extract_verify_missing_prompt(body=body, names=names)
+    return _generate_parsed(prompt, model, prompts.VERIFY_MISSING_SCHEMA, num_predict=500)
+
+
+def verify_each_failed(per_name: dict) -> bool:
+    """True if any of the three binary checks failed."""
+    return not (per_name["in_body"] and per_name["is_person"] and per_name["is_single"])
 
 
 def char_merge_eval(

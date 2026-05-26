@@ -1,20 +1,22 @@
 """Per-episode pipeline stage. Driver (main.py) constructs the registry,
 picks the model + out_dir, and loops over episodes.
 
-Per ep, top to bottom: extract → verify → (ep1 short-circuit OR merge_eval →
-merge_judge → merge_prune → update_reg_b → consolidate → update_history →
-update_reg_c) → summarize. The registry mutates in place across eps; file
-IO happens at clearly visible save_result / dump_json sites only.
+Per ep, top to bottom: extract → verify_each (loop) → verify_missing →
+(ep1 short-circuit OR merge_eval → merge_judge → merge_prune →
+update_reg_b → consolidate → update_history → update_reg_c) → summarize.
+The registry mutates in place across eps; file IO happens at clearly
+visible save_result / dump_json sites only.
 
 Output layout (under out_dir):
   chars/
     01_extract/<stem>.{json,prompt.txt,meta.json}
-    02_extract_verify/<stem>.{json,prompt.txt,meta.json}
-    03_merge_eval/<stem>/<cname>.{json,prompt.txt,meta.json}   (ep2+)
-    04_merge_judge/<stem>/<cname>.{json,prompt.txt,meta.json}  (ep2+)
-    05_merge_prune/<stem>/<cname>.{json,prompt.txt,meta.json}  (ep2+)
-    06_consolidate/<stem>/<cid>.{json,prompt.txt,meta.json}    (ep2+)
-    07_update_history/<stem>/<cid>.{json,prompt.txt,meta.json} (ep2+)
+    02_verify_each/<stem>/<cname>.{json,prompt.txt,meta.json}
+    03_verify_missing/<stem>.{json,prompt.txt,meta.json}
+    04_merge_eval/<stem>/<cname>.{json,prompt.txt,meta.json}    (ep2+)
+    05_merge_judge/<stem>/<cname>.{json,prompt.txt,meta.json}   (ep2+)
+    06_merge_prune/<stem>/<cname>.{json,prompt.txt,meta.json}   (ep2+)
+    07_consolidate/<stem>/<cid>.{json,prompt.txt,meta.json}     (ep2+)
+    08_update_history/<stem>/<cid>.{json,prompt.txt,meta.json}  (ep2+)
     registry.json
   summaries/<stem>.{json,prompt.txt,meta.json}
 """
@@ -51,21 +53,38 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
         "model": model,
     }
 
-    # extract + verify -----------------------------------------------------
+    # extract --------------------------------------------------------------
     print("  [extract]", flush=True)
     extract = core.char_extract(**ctx, registry=registry)
     common.save_result(chars / "01_extract", stem, extract)
     names = extract.output
 
-    print("  [extract_verify]", flush=True)
-    verify = core.char_extract_verify(body=body, names=names, model=model)
-    common.save_result(chars / "02_extract_verify", stem, verify)
-    v = verify.output
-    if not v["complete"] or v["hallucination"]:
+    # verify_each (per-name validity, body-only) ---------------------------
+    print(f"  [verify_each] {len(names)} targets", flush=True)
+    veach_dir = chars / "02_verify_each" / stem
+    veach: dict[str, common.Result] = {}
+    for n in names:
+        cname = n["canonical_name"]
+        r = core.char_extract_verify_each(
+            body=body,
+            target_canonical_name=cname,
+            target_evidence_quote=n["evidence_quote"],
+            model=model,
+        )
+        common.save_result(veach_dir, cname, r)
+        veach[cname] = r
+    bad = [c for c, r in veach.items() if core.verify_each_failed(r.output)]
+
+    # verify_missing (completeness, body-only) -----------------------------
+    print("  [verify_missing]", flush=True)
+    vmiss = core.char_extract_verify_missing(body=body, names=names, model=model)
+    common.save_result(chars / "03_verify_missing", stem, vmiss)
+    missing = vmiss.output["missing"]
+
+    if bad or missing:
         raise SystemExit(
             f"ep{seq} extract failed verification "
-            f"(complete={v['complete']} hallucination={v['hallucination']} "
-            f"missing={v['missing']} hallucinated={v['hallucinated']})"
+            f"(bad={bad} missing={missing})"
         )
 
     # merge + apply --------------------------------------------------------
@@ -74,7 +93,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
         core.update_reg_a(registry, names, seq)
     else:
         print(f"  [merge_eval] {len(names)} targets", flush=True)
-        eval_dir = chars / "03_merge_eval" / stem
+        eval_dir = chars / "04_merge_eval" / stem
         evals: dict[str, common.Result] = {}
         for n in names:
             cname = n["canonical_name"]
@@ -85,7 +104,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
             evals[cname] = r
 
         print(f"  [merge_judge] {len(names)} targets", flush=True)
-        judge_dir = chars / "04_merge_judge" / stem
+        judge_dir = chars / "05_merge_judge" / stem
         judges: dict[str, common.Result] = {}
         for n in names:
             cname = n["canonical_name"]
@@ -103,7 +122,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
             n for n in names if not core.judge_existing_cnames(judges[n["canonical_name"]].output)
         ]
         print(f"  [merge_prune] {len(new_targets)} new", flush=True)
-        prune_dir = chars / "05_merge_prune" / stem
+        prune_dir = chars / "06_merge_prune" / stem
         prunes: dict[str, common.Result] = {}
         for n in new_targets:
             cname = n["canonical_name"]
@@ -124,7 +143,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
 
         ids = core.touched_ids(registry, seq)
         print(f"  [consolidate] {len(ids)} ids", flush=True)
-        cons_dir = chars / "06_consolidate" / stem
+        cons_dir = chars / "07_consolidate" / stem
         consolidations: dict[str, common.Result] = {}
         for cid in ids:
             r = core.char_consolidate(
@@ -137,7 +156,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
             consolidations[cid] = r
 
         print(f"  [update_history] {len(ids)} ids", flush=True)
-        hist_dir = chars / "07_update_history" / stem
+        hist_dir = chars / "08_update_history" / stem
         histories: dict[str, common.Result] = {}
         for cid in ids:
             r = core.char_update_history(**ctx, registry=registry, target_id=cid)

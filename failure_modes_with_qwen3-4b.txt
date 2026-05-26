@@ -1,0 +1,155 @@
+Observed in semantic_summary/2026-05-26_1752_Qwen3-4B-Q8_0/ (ep1–ep5).
+Filled in on top of overall_failure_modes.txt — only adds Qwen3-4B-Q8_0
+specific behaviour, with concrete evidence pointers.
+
+char_extract
+- picks up non-character entities (every episode keeps "オードグズ" the
+  world, ep3+ keeps "村" the village). The prompt rule
+  "人間・人型存在・人格を持つ存在のみ" is not honored.
+- copies the per-character description forward without rewriting from the
+  current body. id=1 ("私") description stays "5歳のオードグズの住民" in
+  ep5 where she is 8 and forest-dwelling. Mother's desc in ep4/ep5
+  ("家族との関係が崩れ、未来への不安を感じる存在") is actually the
+  protagonist's emotional state copy-pasted onto the mother.
+- with the registry in context, fills `other_names` of one character with
+  the canonical_names of unrelated characters. ep4/ep5 extract for "私"
+  carries other_names = ["テイマー","主人公","占い師","オードグズ","姉"].
+  This drives the worst downstream corruption: those names are then merged
+  into id=1's aliases. The rule from overall_failure_modes.txt — "本文に
+  現れる呼び方の中から選ぶ。既存の人物の名前を流用しない" — is needed.
+- groups multiple people in a single entry ("兄と姉" in ep2). With no rule
+  forbidding joint extract entries the downstream cannot recover a clean
+  "兄" / "姉" pair.
+- misses identity-revealing facts in the body: ep5 body has「タブロは
+  父の名前。」 but extract emits no other_names for 父 and produces a
+  generic re-used description.
+
+char_extract_verify
+- rubber-stamps every episode (complete=true / hallucination=false for ep1–5
+  with no exceptions). It does not detect:
+   * other_names cross-contamination (私's other_names including 占い師,
+     オードグズ, 姉).
+   * world-as-character (オードグズ, 村).
+   * generic "影響を与える存在" descriptions that don't match the body.
+  In this run verify is effectively dead code: it never produces an
+  actionable verdict. The pipeline relies on it as a guard rail
+  (raise SystemExit on failure) and gets zero protection.
+
+char_merge_eval
+- treats "candidate exists / is described in registry" as evidence of being
+  the same person as the target. ep5 target=父 rates 私, 占い師, 父, 神様,
+  オードグズ, 村, 母, 村長 all as "likely" — every existing entry is
+  "likely the same as 父". Evidence string is just "候補が ... として
+  登場している" for each.
+- flips the polarity entirely when target shares no surface form with any
+  existing entry. ep2 target=父 rates 私, 母, 父, 占い師, 神様, オードグズ
+  all "impossible" (including the existing 父!), with reasoning "父 is
+  avoiding me, but I am 私, so 父 ≠ 私" — applied to every candidate.
+  That cascade is what produced the duplicate 父 entry (id=3 and id=7).
+- "新規" tier reasoning is incoherent: it justifies a likelihood for
+  "target is a new character" by describing what the target does in the
+  body, never weighing it against existing entries.
+- once registry aliases are polluted (e.g. id=1 "私" gains alias "占い師"),
+  later eval rounds amplify: ep5 target=占い師 rates 私=likely because the
+  registry's 私 entry has 占い師 in its aliases.
+
+char_merge_judge
+- approves multiple existing candidates as true for the same target,
+  creating false joint merges:
+   * ep2 target=兄と姉 → verdict=true for 私, 母, 父 (registry gets seq=2
+     stamped on three unrelated entries; no entry is created for 兄/姉).
+   * ep4 target=私 → verdict=true for 私, 占い師, 父, 神様 (forces a
+     four-way joint match through update_reg_b).
+- approves "新規"=true simultaneously with an existing-cname=true (ep2
+  target=私, ep3 target=占い師, ep3 target=オードグズ, ep3 target=姉,
+  ep4 target=私, ep5 target=父). The downstream collapse drops 新規 so
+  the bad new-character allocation is masked here, but the verdict is
+  logically broken regardless.
+- when eval has already wiped every existing candidate to "impossible",
+  judge sees an empty候補 set and rubber-stamps 新規=true — that path
+  produced the duplicate 父 entry in ep2 and duplicate 占い師 in ep4/5.
+  Symptom of the wider eval failure but worth flagging at judge: it has
+  no fallback when the candidate set is empty for an obvious-match target.
+
+char_merge_prune_candidates (non-LLM)
+- working as designed; the breakage above is upstream. Worth noting that
+  with eval flooding "likely" tiers, the prune step often keeps the wrong
+  candidates rather than narrowing.
+
+char_merge_prune
+- keeps non-character entities (ep3 keep=true for 村 and 神様, ep4 keep=true
+  for オードグズ, 村長, 母). The prompt rule "一般化された群や役割の総称
+  ... は keep=false" is not honored. Every keep verdict in this run is
+  "true" — the stage never rejects anything.
+- reasoning regresses to "本文で言及されている → keep=true" with no
+  filtering for character-ness.
+
+char_consolidate
+- echoes whatever aliases are currently on the entry. ep3 and ep4 id=1
+  consolidations preserve 占い師, オードグズ, 姉 in 私's aliases even
+  though those are obviously different characters. The "意味のある呼び名
+  のみ残す" rule is not exercised — once garbage enters aliases it never
+  leaves.
+- description drift: id=1's description is unchanged from ep1 through ep5
+  even after major events (became forest-dweller at age 8). Each pass
+  outputs the same string. The "最新の情報を反映" rule is not honored.
+- the nested-JSON 整理対象 block (id / current / new_surface_forms_this_
+  episode) is interpreted as "include every new_surface_forms_this_episode
+  in aliases", which is how 占い師/姉/オードグズ keep getting re-injected
+  into id=1. Already flagged in overall_failure_modes.txt — confirmed
+  here as the primary corruption channel.
+
+char_update_history
+- hallucinates a name reveal that is not in the body: ep4 id=1 ("私")
+  gets new_history "占い師の本名が「アイビー」と判明". アイビー does not
+  appear anywhere in episode bodies. And the reveal is attached to id=1
+  (the protagonist) instead of an 占い師 id, because id=1's polluted
+  aliases include "占い師" and the model latches onto that.
+- misses the real identity reveal: ep5 body says「タブロは父の名前。」
+  yet id=7 (父) update_history says "父の同一性に関する変化は見つから
+  ない。" That is the exact prompt example of an in-scope change
+  (本名・正体が判明した) and the model still says null.
+- false negatives elsewhere too: ep4 id=4 ("占い師") on the episode where
+  the occultist dies → null with reason "状況描写". Death itself may not
+  be an identity change, but the eps body also implies the occultist had
+  no living family / was 煙たがられていた — neither captured.
+
+summarize
+- introduces facts not in the body: ep2 summary says 主人公は村から逃げ
+  出すことを決意 — in ep2 she only goes to the forest for food and goes
+  home to sleep. ep5 summary says 最終的に村を離れ、森の空洞に隠れる —
+  she leaves the village and runs the opposite direction; the cavity is
+  where she retrieved the sword, not where she hid.
+- elides the actually-noteworthy beats: ep5 says nothing about タブロが
+  父であると判明, nothing about 村長 conspiring against her.
+- copies the prior summary's framing forward (every summary leads with
+  "主人公は…"), which compounds with the descriptions getting frozen.
+
+registry-level emergent failures (cross-stage)
+- duplicate canonical_names per cid: 占い師 occupies id=2, 4, 10; 父 at
+  id=3 and 7; 神様 at id=5 and 8. Already flagged structurally in
+  overall_failure_modes.txt — confirmed: each duplicate stems from a
+  specific eval/judge failure (eval wiping to impossible, then judge
+  defaulting to 新規=true).
+- id=1 ("私") accumulates aliases of three other characters
+  (占い師, オードグズ, 姉, 村の占い師) and never sheds them.
+- entries that should not exist: id=6 (オードグズ — world), id=9 (村 —
+  village). Created by extract+kept by prune.
+- no entry for 兄/姉 although they are explicitly named in ep2 ("戸惑う
+  兄と姉") and ep3 ("兄や姉にも"). Caused by the "兄と姉" joint extract
+  + the joint-merge in update_reg_b dropping aliases.
+
+severity summary
+- the dominant problem is char_merge_eval's failure to use "same person
+  as target" semantics. It cascades into:
+   * judge cannot distinguish target identity → multi-true verdicts
+   * update_reg_b runs the joint-aliases path and corrupts entries
+   * consolidate freezes the corruption into the registry
+   * update_history then narrates the corrupted entry's mixed aliases
+- char_extract_verify being a no-op removes the only structural guard
+  the pipeline has against any of the above.
+- merge_prune being a yes-stamp removes the only filter that could keep
+  non-characters out.
+- so three of the four LLM-judgement gates (eval, verify, prune) are
+  effectively inert for this model at this size, which is why ep1's
+  extract noise persists all the way to ep5.
