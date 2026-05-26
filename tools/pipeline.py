@@ -1,24 +1,43 @@
 """Per-episode pipeline stage. Driver (main.py) constructs the registry,
 picks the model + out_dir, and loops over episodes.
 
-Per ep, top to bottom: extract → verify_each (loop) → verify_missing →
-(ep1 short-circuit OR merge_eval → merge_judge → merge_prune →
-update_reg_b → consolidate → update_history → update_reg_c) → summarize.
+Per ep, top to bottom: extract → verify_quote (mechanical fallback) →
+verify_semantics (loop) → verify_missing → (update_reg_initial for ep1, or
+merge_eval → merge_judge → merge_prune → update_reg_merge for ep2+) →
+consolidate → (update_history for ep2+) → update_reg_semantics → summarize.
 The registry mutates in place across eps; file IO happens at clearly
 visible save_result / dump_json sites only.
 
 Output layout (under out_dir):
   chars/
     01_extract/<stem>.{json,prompt.txt,meta.json}
-    02_verify_each/<stem>/<cname>.{json,prompt.txt,meta.json}
-    03_verify_missing/<stem>.{json,prompt.txt,meta.json}
-    04_merge_eval/<stem>/<cname>.{json,prompt.txt,meta.json}    (ep2+)
-    05_merge_judge/<stem>/<cname>.{json,prompt.txt,meta.json}   (ep2+)
-    06_merge_prune/<stem>/<cname>.{json,prompt.txt,meta.json}   (ep2+)
-    07_consolidate/<stem>/<cid>.{json,prompt.txt,meta.json}     (ep2+)
-    08_update_history/<stem>/<cid>.{json,prompt.txt,meta.json}  (ep2+)
-    registry.json
+    02_verify_quote/<stem>/<cname>.{json,prompt.txt,meta.json}   (fallback)
+    03_verify_semantics/<stem>/<cname>.{json,prompt.txt,meta.json}
+    04_verify_missing/<stem>.{json,prompt.txt,meta.json}
+    05_merge_eval/<stem>/<cname>.{json,prompt.txt,meta.json}    (ep2+)
+    06_merge_judge/<stem>/<cname>.{json,prompt.txt,meta.json}   (ep2+)
+    07_merge_prune/<stem>/<cname>.{json,prompt.txt,meta.json}   (ep2+)
+    08_consolidate/<stem>/<cid>.{json,prompt.txt,meta.json}     (ep2+)
+    09_update_history/<stem>/<cid>.{json,prompt.txt,meta.json}  (ep2+)
+    10_register/<stem>.json                                     (snapshot)
+    registry.json                                               (latest)
   summaries/<stem>.{json,prompt.txt,meta.json}
+
+Each attempt:
+  - char_extract (one LLM call, dedup) saved as `<stem>.json` (attempt 1)
+    or `<stem>.try-N.json` (attempts 2+).
+  - per-name verify_quote on any mechanical-bad evidence_excerpt:
+    confirmed-absent entries are dropped, model-corrected quotes
+    replace the bad ones, model-insists-without-valid-quote → crash.
+    Outputs under `02_verify_quote/<save_stem>/<cname>.{...}`.
+  - verify_semantics + classify + verify_missing on the cleaned list.
+  - if verify_semantics finds bad entries or verify_missing finds missing,
+    that's a model issue → retry the whole extract with feedback.
+Mechanical-bad quotes never trigger a full re-extract.
+
+Naming: attempt 1 success leaves all paths unsuffixed. Attempt 1
+failure renames everything to `.try-1`. Attempts 2+ write `.try-N`
+from the start. Successful winning attempt has `.ok` appended.
 """
 
 import time
@@ -27,12 +46,33 @@ from typing import TypedDict
 
 from . import common, core
 
+EXTRACT_MAX_ATTEMPTS = 3
+
 
 class StageCtx(TypedDict):
-    body: str
-    prev_body: str
+    episode_text: str
+    prev_episode_text: str
     prior_summaries: list[str]
     model: str
+
+
+def _rename(chars: Path, from_stem: str, to_stem: str) -> None:
+    """Rename per-attempt outputs from `from_stem` to `to_stem`. Touches
+    file pairs in 01_extract / 03_verify_missing and subdirs in
+    02_verify_semantics / 02_verify_quote. Used to (a) suffix the unsuffixed
+    attempt-1 outputs to `.try-1` when attempt-1 fails, and (b) attach
+    `.ok` to a winning attempt's stem on success. Attempts 2+ already
+    write with `.try-N` from the start, so they only need the `.ok`
+    rename."""
+    for d in (chars / "01_extract", chars / "04_verify_missing"):
+        for ext in ("json", "meta.json", "prompt.txt"):
+            src = d / f"{from_stem}.{ext}"
+            if src.exists():
+                src.rename(d / f"{to_stem}.{ext}")
+    for subdir_name in ("02_verify_quote", "03_verify_semantics"):
+        d = chars / subdir_name / from_stem
+        if d.exists():
+            d.rename(chars / subdir_name / to_stem)
 
 
 def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
@@ -42,73 +82,189 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
 
     t0 = time.perf_counter()
     print(f"\n=== ep{seq:03d} ===", flush=True)
-    body = common.read_episode(seq)
-    prev_body = "" if seq == 1 else common.read_episode(seq - 1)
+    episode_text = common.read_episode(seq)
+    prev_episode_text = "" if seq == 1 else common.read_episode(seq - 1)
     prior = core.load_prior_summaries(summaries, before_seq=max(1, seq - 1))
     stem = common.episode_stem(seq)
     ctx: StageCtx = {
-        "body": body,
-        "prev_body": prev_body,
+        "episode_text": episode_text,
+        "prev_episode_text": prev_episode_text,
         "prior_summaries": prior,
         "model": model,
     }
 
-    # extract --------------------------------------------------------------
-    print("  [extract]", flush=True)
-    extract = core.char_extract(**ctx, registry=registry)
-    common.save_result(chars / "01_extract", stem, extract)
-    names = extract.output
+    # extract + verify with retry loop -------------------------------------
+    # One retry level. Each attempt:
+    #   1. char_extract (one LLM call, dedup) — saved unsuffixed.
+    #   2. mechanical substring pre-check — if any evidence_excerpt isn't in
+    #      episode_text, skip verify_semantics / verify_missing entirely and
+    #      go straight to retry with feedback. No wasted LLM calls.
+    #   3. otherwise: verify_semantics + classify, then verify_missing.
+    #   4. if bad or missing → archive current unsuffixed as `.try-N`
+    #      and continue; otherwise (if multi-attempt) rename current
+    #      unsuffixed as `.try-N.success` and break.
+    # Final disk state:
+    #   - Single-attempt success: `<stem>.json` (no decoration).
+    #   - Multi-attempt success: `<stem>.try-1.json` ... +
+    #     `<stem>.try-N.ok.json` (winner).
+    #   - All attempts failed: `<stem>.try-1..MAX.json`, then crash.
+    retry_feedback: str | None = None
+    names: list[dict] = []
+    bad: list[tuple[str, str]] = []
+    missing: list[str] = []
+    for attempt in range(1, EXTRACT_MAX_ATTEMPTS + 1):
+        # Attempt 1 writes to unsuffixed paths so a clean single-attempt
+        # success leaves no decoration on disk. Attempts 2+ write directly
+        # to `<stem>.try-N` from the start — no after-the-fact archiving
+        # of the unsuffixed file.
+        save_stem = stem if attempt == 1 else f"{stem}.try-{attempt}"
+        if attempt > 1:
+            print(f"  [extract] retry {attempt}/{EXTRACT_MAX_ATTEMPTS}", flush=True)
+        else:
+            print("  [extract]", flush=True)
+        extract = core.char_extract(**ctx, registry=registry, retry_feedback=retry_feedback)
+        common.save_result(chars / "01_extract", save_stem, extract)
 
-    # verify_each (per-name validity, body-only) ---------------------------
-    print(f"  [verify_each] {len(names)} targets", flush=True)
-    veach_dir = chars / "02_verify_each" / stem
-    veach: dict[str, common.Result] = {}
-    for n in names:
-        cname = n["canonical_name"]
-        r = core.char_extract_verify_each(
-            body=body,
-            target_canonical_name=cname,
-            target_evidence_quote=n["evidence_quote"],
-            model=model,
+        # Per-name mechanical recovery: for each character whose
+        # evidence_excerpt isn't a substring of episode_text, ask the model
+        # whether the character is in body at all and, if so, supply a
+        # corrected quote. Confirmed-absent characters get dropped;
+        # corrected ones get their quotes replaced in-place. A model that
+        # insists on being in body without a valid corrected quote is a
+        # crash. This avoids re-running the whole extract just for
+        # fixable per-name quote problems — extract retries are reserved
+        # for verify_semantics / verify_missing failures.
+        mech_bad = core.extract_quote_mechanical_bad(
+            extract.output,
+            episode_text=episode_text,
+            prev_episode_text=prev_episode_text,
+            prior_summaries=prior,
+            registry=registry,
         )
-        common.save_result(veach_dir, cname, r)
-        veach[cname] = r
-    bad = [c for c, r in veach.items() if core.verify_each_failed(r.output)]
+        if mech_bad:
+            print(f"  [extract mechanical bad] {[c for c, _ in mech_bad]}", flush=True)
+            vquote_dir = chars / "02_verify_quote" / save_stem
+            confirmed_drops: list[str] = []
+            saved: list[str] = []
+            insisting: list[tuple[str, str]] = []
+            chars_by_name = {c["canonical_name"]: c for c in extract.output["characters"]}
+            for cname, _ in mech_bad:
+                entry = chars_by_name[cname]
+                r = core.char_extract_verify_quote(
+                    episode_text=episode_text,
+                    target_canonical_name=cname,
+                    target_evidence_excerpt=entry["evidence_excerpt"],
+                    model=model,
+                )
+                common.save_result(vquote_dir, cname, r)
+                out = r.output
+                if not out["in_body"]:
+                    confirmed_drops.append(cname)
+                    continue
+                corrected = out.get("correct_evidence_excerpt")
+                if corrected and core.quote_in_episode_text(corrected, episode_text):
+                    entry["evidence_excerpt"] = corrected
+                    saved.append(cname)
+                else:
+                    insisting.append((cname, out["reason"]))
 
-    # verify_missing (completeness, body-only) -----------------------------
-    print("  [verify_missing]", flush=True)
-    vmiss = core.char_extract_verify_missing(body=body, names=names, model=model)
-    common.save_result(chars / "03_verify_missing", stem, vmiss)
-    missing = vmiss.output["missing"]
+            if insisting:
+                raise SystemExit(
+                    f"ep{seq} extract: {len(insisting)} character(s) the model insists are "
+                    f"in <本文> but provided no valid corrected quote: {insisting}"
+                )
+
+            if confirmed_drops:
+                print(f"  [verify_quote confirmed drops] {confirmed_drops}", flush=True)
+            if saved:
+                print(f"  [verify_quote saved with corrected quote] {saved}", flush=True)
+            extract.output["characters"] = [
+                c for c in extract.output["characters"]
+                if c["canonical_name"] not in confirmed_drops
+            ]
+            common.save_result(chars / "01_extract", save_stem, extract)
+
+        names = core.extract_persons(extract.output)
+        vsem_dir = chars / "03_verify_semantics" / save_stem
+        print(f"  [verify_semantics] {len(names)} targets", flush=True)
+        vsem_results: list[tuple[dict, dict]] = []
+        for n in names:
+            cname = n["canonical_name"]
+            r = core.char_extract_verify_semantics(
+                episode_text=episode_text,
+                target_canonical_name=cname,
+                target_evidence_excerpt=n["evidence_excerpt"],
+                model=model,
+            )
+            common.save_result(vsem_dir, cname, r)
+            vsem_results.append((n, r.output))
+        names, bad, dropped, splits, collapsed = core.classify_verify_semantics_results(
+            vsem_results, episode_text
+        )
+        if splits:
+            print(f"  [verify_semantics splits] {splits}", flush=True)
+        if dropped:
+            print(f"  [verify_semantics dropped] {dropped}", flush=True)
+        if collapsed:
+            print(f"  [verify_semantics dedup] collapsed: {collapsed}", flush=True)
+
+        print("  [verify_missing]", flush=True)
+        vmiss = core.char_extract_verify_missing(
+            episode_text=episode_text, names=names, model=model
+        )
+        common.save_result(chars / "04_verify_missing", save_stem, vmiss)
+        missing = vmiss.output["missing"]
+
+        if not bad and not missing:
+            if attempt > 1:
+                _rename(chars, save_stem, f"{save_stem}.ok")
+            break
+
+        # Failed attempt (verify_semantics or verify_missing surfaced issues).
+        # Attempt 1 was written unsuffixed; suffix it now. Attempts 2+ are
+        # already at `.try-N`, no rename needed.
+        if attempt == 1:
+            _rename(chars, stem, f"{stem}.try-1")
+
+        if attempt < EXTRACT_MAX_ATTEMPTS:
+            kept_names = [n["canonical_name"] for n in names]
+            retry_feedback = core.build_extract_retry_feedback(bad, missing, kept_names)
+            print(
+                f"  [extract retry signal] kept={kept_names} bad={bad} missing={missing}",
+                flush=True,
+            )
 
     if bad or missing:
         raise SystemExit(
-            f"ep{seq} extract failed verification "
+            f"ep{seq} extract failed verification after {EXTRACT_MAX_ATTEMPTS} attempts "
             f"(bad={bad} missing={missing})"
         )
 
     # merge + apply --------------------------------------------------------
-    if not registry:
-        print("  [update_reg_a]", flush=True)
-        core.update_reg_a(registry, names, seq)
+    # Per-stage dicts store .output directly (pipeline never needs the
+    # surrounding Result; prompts/metas are already on disk from save_result).
+    is_ep1 = not registry
+    if is_ep1:
+        print("  [update_reg_initial]", flush=True)
+        core.update_reg_initial(registry, names, seq)
     else:
         print(f"  [merge_eval] {len(names)} targets", flush=True)
-        eval_dir = chars / "04_merge_eval" / stem
-        evals: dict[str, common.Result] = {}
+        eval_dir = chars / "05_merge_eval" / stem
+        evals: dict[str, dict] = {}
         for n in names:
             cname = n["canonical_name"]
             r = core.char_merge_eval(
                 **ctx, registry=registry, names=names, target_canonical_name=cname
             )
             common.save_result(eval_dir, cname, r)
-            evals[cname] = r
+            evals[cname] = r.output
 
         print(f"  [merge_judge] {len(names)} targets", flush=True)
-        judge_dir = chars / "05_merge_judge" / stem
-        judges: dict[str, common.Result] = {}
+        judge_dir = chars / "06_merge_judge" / stem
+        judges: dict[str, dict] = {}
         for n in names:
             cname = n["canonical_name"]
-            cand_reg = core.char_merge_prune_candidates(registry, evals[cname].output)
+            cand_reg = core.char_merge_prune_candidates(registry, evals[cname])
             r = core.char_merge_judge(
                 **ctx,
                 registry=registry,
@@ -116,62 +272,63 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
                 target_canonical_name=cname,
             )
             common.save_result(judge_dir, cname, r)
-            judges[cname] = r
+            judges[cname] = r.output
 
-        new_targets = [
-            n for n in names if not core.judge_existing_cnames(judges[n["canonical_name"]].output)
-        ]
+        new_targets = core.judge_new_target_names(names, judges)
         print(f"  [merge_prune] {len(new_targets)} new", flush=True)
-        prune_dir = chars / "06_merge_prune" / stem
-        prunes: dict[str, common.Result] = {}
+        prune_dir = chars / "07_merge_prune" / stem
+        prunes: dict[str, dict] = {}
         for n in new_targets:
             cname = n["canonical_name"]
             r = core.char_merge_prune(
                 **ctx, registry=registry, names=names, target_canonical_name=cname
             )
             common.save_result(prune_dir, cname, r)
-            prunes[cname] = r
+            prunes[cname] = r.output
 
-        print("  [update_reg_b]", flush=True)
-        core.update_reg_b(
-            registry,
-            names,
-            {k: v.output for k, v in judges.items()},
-            {k: v.output for k, v in prunes.items()},
-            seq,
+        print("  [update_reg_merge]", flush=True)
+        core.update_reg_merge(registry, names, judges, evals, prunes, seq)
+
+    # consolidate runs every episode — for ep1 it populates the desc /
+    # canonical_name / aliases that update_reg_initial left empty; for ep2+ it
+    # folds the merge results.
+    ids = core.touched_ids(registry, seq)
+    print(f"  [consolidate] {len(ids)} ids", flush=True)
+    cons_dir = chars / "08_consolidate" / stem
+    consolidations: dict[str, dict] = {}
+    for cid in ids:
+        r = core.char_consolidate(
+            **ctx,
+            registry=registry,
+            target_id=cid,
+            target_surface_forms=core.surface_forms_for(cid, registry, names),
         )
+        common.save_result(cons_dir, cid, r)
+        consolidations[cid] = r.output
 
-        ids = core.touched_ids(registry, seq)
-        print(f"  [consolidate] {len(ids)} ids", flush=True)
-        cons_dir = chars / "07_consolidate" / stem
-        consolidations: dict[str, common.Result] = {}
-        for cid in ids:
-            r = core.char_consolidate(
-                **ctx,
-                registry=registry,
-                target_id=cid,
-                target_surface_forms=core.surface_forms_for(cid, registry, names),
-            )
-            common.save_result(cons_dir, cid, r)
-            consolidations[cid] = r
-
+    # update_history only runs for ep2+. On ep1 every entry is 初登場 and
+    # there's nothing earlier to compare against; running it would burn LLM
+    # calls returning new_history=null.
+    histories: dict[str, dict] = {}
+    if not is_ep1:
         print(f"  [update_history] {len(ids)} ids", flush=True)
-        hist_dir = chars / "08_update_history" / stem
-        histories: dict[str, common.Result] = {}
+        hist_dir = chars / "09_update_history" / stem
         for cid in ids:
             r = core.char_update_history(**ctx, registry=registry, target_id=cid)
             common.save_result(hist_dir, cid, r)
-            histories[cid] = r
+            histories[cid] = r.output
 
-        print("  [update_reg_c]", flush=True)
-        core.update_reg_c(
-            registry,
-            {k: v.output for k, v in consolidations.items()},
-            {k: v.output for k, v in histories.items()},
-            seq,
-        )
+    print("  [update_reg_semantics]", flush=True)
+    core.update_reg_semantics(registry, consolidations, histories, seq)
 
+    # 10_register: snapshot the post-merge registry state for this episode.
+    # Both the rolling registry.json (downstream's current state) and the
+    # per-episode snapshot point at the same data — snapshots make the
+    # merge stage's mutations inspectable episode-by-episode.
     common.dump_json(registry, registry_path)
+    register_dir = chars / "10_register"
+    register_dir.mkdir(parents=True, exist_ok=True)
+    common.dump_json(registry, register_dir / f"{stem}.json")
 
     # summarize ------------------------------------------------------------
     print("  [summarize]", flush=True)

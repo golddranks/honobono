@@ -36,9 +36,13 @@ MODELS: dict[str, tuple[str, str]] = {
         f"{HF}/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q8_0.gguf",
         "Qwen3-4B-Q8_0.gguf",
     ),
-    "gemma3-27b": (
-        f"{HF}/google/gemma-3-27b-it-qat-q4_0-gguf/resolve/main/gemma-3-27b-it-q4_0.gguf",
-        "gemma-3-27b-it-q4_0.gguf",
+    "qwen3-8b": (
+        f"{HF}/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q8_0.gguf",
+        "Qwen3-8B-Q8_0.gguf",
+    ),
+    "qwen3-14b": (
+        f"{HF}/Qwen/Qwen3-14B-GGUF/resolve/main/Qwen3-14B-Q8_0.gguf",
+        "Qwen3-14B-Q8_0.gguf",
     ),
     "qwen3-30b-a3b": (
         f"{HF}/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q8_0.gguf",
@@ -47,6 +51,14 @@ MODELS: dict[str, tuple[str, str]] = {
     "qwen3-32b": (
         f"{HF}/Qwen/Qwen3-32B-GGUF/resolve/main/Qwen3-32B-Q8_0.gguf",
         "Qwen3-32B-Q8_0.gguf",
+    ),
+    "gemma3-12b": (
+        f"{HF}/google/gemma-3-12b-it-qat-q4_0-gguf/resolve/main/gemma-3-12b-it-q4_0.gguf",
+        "gemma-3-12b-it-q4_0.gguf",
+    ),
+    "gemma3-27b": (
+        f"{HF}/google/gemma-3-27b-it-qat-q4_0-gguf/resolve/main/gemma-3-27b-it-q4_0.gguf",
+        "gemma-3-27b-it-q4_0.gguf",
     ),
 }
 
