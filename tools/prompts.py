@@ -367,24 +367,45 @@ def char_extract_verify_quote_prompt(
     target_canonical_name: str,
     target_evidence_excerpt: str,
     failed_corrections: list[str] | tuple[str, ...] = (),
+    rejected_excerpts: list[str] | tuple[str, ...] = (),
 ) -> str:
-    failed_block = ""
+    """Per-name "is this character actually in body?" verification.
+    Invoked when the previous evidence_excerpt was rejected — either
+    mechanically (not a substring of body) or semantically (doesn't
+    refer to the target). The prompt is agnostic about which: it just
+    asks the model to recheck the target's presence and supply a
+    correct excerpt or admit absence.
+
+    `failed_corrections` carries excerpts that the internal retry loop
+    has already rejected as non-substrings. `rejected_excerpts` carries
+    excerpts the caller already knows are inadequate (typically the
+    original extract excerpt that triggered this verification). Both
+    are surfaced to the model so it doesn't repeat the same answer."""
+    blocks: list[str] = []
+    if rejected_excerpts:
+        bullets = "\n".join(f"- 「{q}」" for q in rejected_excerpts)
+        blocks.append(
+            "前回の判定で以下の evidence_excerpt は不適切と判定されました"
+            "（本文に存在しない、または対象を指していない、もしくは捏造の可能性）:\n"
+            f"{bullets}\n"
+            "これらを再提示せず、別の有効な引用を選ぶか、in_body=false としてください。"
+        )
     if failed_corrections:
         bullets = "\n".join(f"- 「{q}」" for q in failed_corrections)
-        failed_block = (
-            "\n\n前回の判定で correct_evidence_excerpt として以下を提示しましたが、"
+        blocks.append(
+            "前回の判定で correct_evidence_excerpt として以下を提示しましたが、"
             "いずれも <本文> 中に文字どおりには存在しませんでした:\n"
             f"{bullets}\n"
             "<本文> 内に実在する文字列をそのまま引用してください（要約・言い換え・"
             "改行をまたいだ連結は禁止）。"
         )
+    feedback_block = ("\n\n" + "\n\n".join(blocks)) if blocks else ""
     return f"""人物が <本文> 中に実際に登場するかの判定。
 
 前回の抽出で「{target_canonical_name}」が今回の登場人物として挙げられました。
 そのとき evidence_excerpt として「{target_evidence_excerpt}」が示されましたが、
-これは今回の <本文> の中に文字どおりに存在しません。
-（前話の本文・既存の人物リスト・あらすじから引用された可能性、あるいは捏造の可能性があります。）
-{failed_block}
+これは不適切と判定されました（<本文> 中に存在しない、対象を指していない、
+あるいは捏造の可能性があります）。{feedback_block}
 
 そこで改めて、「{target_canonical_name}」が今回の <本文> の中で
 （どのような呼び方であれ）実際に言及されているかを判定してください。
@@ -395,7 +416,8 @@ def char_extract_verify_quote_prompt(
   どの形であっても <本文> 中に言及があれば in_body=true。
 - どの形でも <本文> 中に全く言及がなければ in_body=false。
 - in_body=true の場合、その実際の言及箇所を correct_evidence_excerpt に書く。
-  <本文> 内に文字どおりに存在する文字列をそのまま引用する（要約・言い換え・連結禁止、50文字以内目安）。
+  <本文> 内に文字どおりに存在し、かつ「{target_canonical_name}」を実際に指している部分を選ぶ
+  （要約・言い換え・連結禁止、50文字以内目安）。
 - in_body=false の場合、correct_evidence_excerpt は null。
 - reason に判定の根拠を一文で。
 

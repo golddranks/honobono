@@ -30,10 +30,15 @@ Each attempt:
     confirmed-absent entries are dropped, model-corrected quotes
     replace the bad ones, model-insists-without-valid-quote → crash.
     Outputs under `02_verify_quote/<save_stem>/<cname>.{...}`.
-  - verify_semantics + classify + verify_missing on the cleaned list.
-  - if verify_semantics finds bad entries or verify_missing finds missing,
-    that's a model issue → retry the whole extract with feedback.
-Mechanical-bad quotes never trigger a full re-extract.
+  - verify_semantics + classify on the cleaned list.
+  - per-entry verify_quote recovery for verify_semantics-bad entries
+    (same mechanism as mechanical-bad): drop or replace excerpt.
+    Outputs under `02_verify_quote/<save_stem>/<cname>.sem.{...}`.
+  - verify_missing on the recovered name list.
+  - if verify_missing finds missing → retry the whole extract with
+    feedback (kept_names + missing).
+Excerpt-level problems never trigger a full re-extract; only genuine
+recall gaps (verify_missing) do.
 
 Naming: attempt 1 success leaves all paths unsuffixed. Attempt 1
 failure renames everything to `.try-1`. Attempts 2+ write `.try-N`
@@ -81,7 +86,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
     registry_path = chars / "registry.json"
 
     t0 = time.perf_counter()
-    print(f"\n=== ep{seq:03d} ===", flush=True)
+    print(f"\n=== ep{seq:03d} ===")
     episode_text = common.read_episode(seq)
     prev_episode_text = "" if seq == 1 else common.read_episode(seq - 1)
     prior = core.load_prior_summaries(summaries, before_seq=max(1, seq - 1))
@@ -94,15 +99,18 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
     }
 
     # extract + verify with retry loop -------------------------------------
-    # One retry level. Each attempt:
+    # One retry level, triggered only by genuine recall gaps. Each attempt:
     #   1. char_extract (one LLM call, dedup) — saved unsuffixed.
-    #   2. mechanical substring pre-check — if any evidence_excerpt isn't in
-    #      episode_text, skip verify_semantics / verify_missing entirely and
-    #      go straight to retry with feedback. No wasted LLM calls.
-    #   3. otherwise: verify_semantics + classify, then verify_missing.
-    #   4. if bad or missing → archive current unsuffixed as `.try-N`
-    #      and continue; otherwise (if multi-attempt) rename current
-    #      unsuffixed as `.try-N.success` and break.
+    #   2. mechanical substring pre-check — for any evidence_excerpt that
+    #      isn't a substring of episode_text, call verify_quote (drop or
+    #      replace excerpt).
+    #   3. verify_semantics + classify on the cleaned list.
+    #   4. per-entry verify_quote recovery on any verify_semantics-bad
+    #      entries — drop or replace excerpt, same as the mechanical-bad
+    #      path. Bad entries no longer trigger full re-extracts.
+    #   5. verify_missing on the recovered name list.
+    #   6. if missing is empty → success. Else archive as `.try-N` and
+    #      retry with feedback (kept_names + missing).
     # Final disk state:
     #   - Single-attempt success: `<stem>.json` (no decoration).
     #   - Multi-attempt success: `<stem>.try-1.json` ... +
@@ -110,7 +118,6 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
     #   - All attempts failed: `<stem>.try-1..MAX.json`, then crash.
     retry_feedback: str | None = None
     names: list[dict] = []
-    bad: list[tuple[str, str]] = []
     missing: list[str] = []
     for attempt in range(1, EXTRACT_MAX_ATTEMPTS + 1):
         # Attempt 1 writes to unsuffixed paths so a clean single-attempt
@@ -119,9 +126,9 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
         # of the unsuffixed file.
         save_stem = stem if attempt == 1 else f"{stem}.try-{attempt}"
         if attempt > 1:
-            print(f"  [extract] retry {attempt}/{EXTRACT_MAX_ATTEMPTS}", flush=True)
+            print(f"  [extract] retry {attempt}/{EXTRACT_MAX_ATTEMPTS}")
         else:
-            print("  [extract]", flush=True)
+            print("  [extract]")
         extract = core.char_extract(**ctx, registry=registry, retry_feedback=retry_feedback)
         common.save_result(chars / "01_extract", save_stem, extract)
 
@@ -142,7 +149,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
             registry=registry,
         )
         if mech_bad:
-            print(f"  [extract mechanical bad] {[c for c, _ in mech_bad]}", flush=True)
+            print(f"  [extract mechanical bad] {[c for c, _ in mech_bad]}")
             vquote_dir = chars / "02_verify_quote" / save_stem
             confirmed_drops: list[str] = []
             saved: list[str] = []
@@ -175,9 +182,9 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
                 )
 
             if confirmed_drops:
-                print(f"  [verify_quote confirmed drops] {confirmed_drops}", flush=True)
+                print(f"  [verify_quote confirmed drops] {confirmed_drops}")
             if saved:
-                print(f"  [verify_quote saved with corrected quote] {saved}", flush=True)
+                print(f"  [verify_quote saved with corrected quote] {saved}")
             extract.output["characters"] = [
                 c for c in extract.output["characters"]
                 if c["canonical_name"] not in confirmed_drops
@@ -186,7 +193,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
 
         names = core.extract_persons(extract.output)
         vsem_dir = chars / "03_verify_semantics" / save_stem
-        print(f"  [verify_semantics] {len(names)} targets", flush=True)
+        print(f"  [verify_semantics] {len(names)} targets")
         vsem_results: list[tuple[dict, dict]] = []
         for n in names:
             cname = n["canonical_name"]
@@ -202,42 +209,125 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
             vsem_results, episode_text
         )
         if splits:
-            print(f"  [verify_semantics splits] {splits}", flush=True)
+            print(f"  [verify_semantics splits] {splits}")
         if dropped:
-            print(f"  [verify_semantics dropped] {dropped}", flush=True)
+            print(f"  [verify_semantics dropped] {dropped}")
         if collapsed:
-            print(f"  [verify_semantics dedup] collapsed: {collapsed}", flush=True)
+            print(f"  [verify_semantics dedup] collapsed: {collapsed}")
 
-        print("  [verify_missing]", flush=True)
+        # Per-entry recovery for verify_semantics-bad entries: same model
+        # as the mechanical-bad path — call verify_quote, then drop the
+        # entry (in_body=false) or replace its excerpt (in_body=true with
+        # a valid corrected excerpt). The original (semantics-rejected)
+        # excerpt is passed as `rejected_excerpts` so the model is
+        # steered away from re-proposing it.
+        #
+        # Subtlety: weak models (4B) can keep claiming in_body=true while
+        # supplying excerpts that refer to a different character (e.g.
+        # 神様 → 占い師). The substring check passes but the entry is
+        # still bogus. To catch this, the corrected excerpt is run
+        # through verify_semantics once more; if it still fails
+        # (quote_refers_to_target=false or any other hard-fail), the
+        # entry is dropped. One re-verify only — no loop.
+        if bad:
+            print(f"  [verify_semantics bad] {[c for c, _ in bad]}")
+            vquote_dir = chars / "02_verify_quote" / save_stem
+            chars_by_name = {c["canonical_name"]: c for c in extract.output["characters"]}
+            sem_drops: list[str] = []
+            sem_saved: list[str] = []
+            sem_insisting: list[tuple[str, str]] = []
+            for cname, _reason in bad:
+                entry = chars_by_name[cname]
+                rejected = entry["evidence_excerpt"]
+                r = core.char_extract_verify_quote(
+                    episode_text=episode_text,
+                    target_canonical_name=cname,
+                    target_evidence_excerpt=rejected,
+                    rejected_excerpts=[rejected],
+                    model=model,
+                )
+                common.save_result(vquote_dir, f"{cname}.sem", r)
+                out = r.output
+                if not out["in_body"]:
+                    sem_drops.append(cname)
+                    continue
+                corrected = out.get("correct_evidence_excerpt")
+                if not (corrected and core.quote_in_episode_text(corrected, episode_text)):
+                    sem_insisting.append((cname, out["reason"]))
+                    continue
+                # Re-verify the corrected excerpt to catch the
+                # "in_body=true but excerpt refers to the wrong
+                # character" failure mode.
+                recheck = core.char_extract_verify_semantics(
+                    episode_text=episode_text,
+                    target_canonical_name=cname,
+                    target_evidence_excerpt=corrected,
+                    model=model,
+                )
+                common.save_result(vsem_dir, f"{cname}.recheck", recheck)
+                persons, drop, fail = core.verify_semantics_resolve(
+                    {"canonical_name": cname, "evidence_excerpt": corrected},
+                    recheck.output,
+                    episode_text,
+                )
+                # For recovery, only the clean single-person-and-same-name
+                # case counts as success. Hard fails (fail set), silent
+                # drops (category != 人物, unsplittable collective), or
+                # the model deciding the corrected excerpt is a different
+                # character / collective → drop the entry.
+                if fail is not None or drop is not None or len(persons) != 1 or persons[0]["canonical_name"] != cname:
+                    sem_drops.append(cname)
+                    continue
+                entry["evidence_excerpt"] = corrected
+                names.append({
+                    "canonical_name": cname,
+                    "evidence_excerpt": corrected,
+                    "category": entry.get("category", "人物"),
+                })
+                sem_saved.append(cname)
+            if sem_insisting:
+                raise SystemExit(
+                    f"ep{seq} extract: {len(sem_insisting)} character(s) the model insists "
+                    f"are in <本文> but provided no valid corrected quote after verify_semantics "
+                    f"rejection: {sem_insisting}"
+                )
+            if sem_drops:
+                print(f"  [verify_semantics→quote drops] {sem_drops}")
+            if sem_saved:
+                print(f"  [verify_semantics→quote saved with corrected quote] {sem_saved}")
+            extract.output["characters"] = [
+                c for c in extract.output["characters"]
+                if c["canonical_name"] not in sem_drops
+            ]
+            common.save_result(chars / "01_extract", save_stem, extract)
+            bad = []
+
+        print("  [verify_missing]")
         vmiss = core.char_extract_verify_missing(
             episode_text=episode_text, names=names, model=model
         )
         common.save_result(chars / "04_verify_missing", save_stem, vmiss)
         missing = vmiss.output["missing"]
 
-        if not bad and not missing:
+        if not missing:
             if attempt > 1:
                 _rename(chars, save_stem, f"{save_stem}.ok")
             break
 
-        # Failed attempt (verify_semantics or verify_missing surfaced issues).
-        # Attempt 1 was written unsuffixed; suffix it now. Attempts 2+ are
-        # already at `.try-N`, no rename needed.
+        # verify_missing surfaced a recall gap. Attempt 1 was written
+        # unsuffixed; suffix it now. Attempts 2+ are already at `.try-N`.
         if attempt == 1:
             _rename(chars, stem, f"{stem}.try-1")
 
         if attempt < EXTRACT_MAX_ATTEMPTS:
             kept_names = [n["canonical_name"] for n in names]
-            retry_feedback = core.build_extract_retry_feedback(bad, missing, kept_names)
-            print(
-                f"  [extract retry signal] kept={kept_names} bad={bad} missing={missing}",
-                flush=True,
-            )
+            retry_feedback = core.build_extract_retry_feedback(missing, kept_names)
+            print(f"  [extract retry signal] kept={kept_names} missing={missing}")
 
-    if bad or missing:
+    if missing:
         raise SystemExit(
             f"ep{seq} extract failed verification after {EXTRACT_MAX_ATTEMPTS} attempts "
-            f"(bad={bad} missing={missing})"
+            f"(missing={missing})"
         )
 
     # merge + apply --------------------------------------------------------
@@ -245,10 +335,10 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
     # surrounding Result; prompts/metas are already on disk from save_result).
     is_ep1 = not registry
     if is_ep1:
-        print("  [update_reg_initial]", flush=True)
+        print("  [update_reg_initial]")
         core.update_reg_initial(registry, names, seq)
     else:
-        print(f"  [merge_eval] {len(names)} targets", flush=True)
+        print(f"  [merge_eval] {len(names)} targets")
         eval_dir = chars / "05_merge_eval" / stem
         evals: dict[str, dict] = {}
         for n in names:
@@ -259,7 +349,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
             common.save_result(eval_dir, cname, r)
             evals[cname] = r.output
 
-        print(f"  [merge_judge] {len(names)} targets", flush=True)
+        print(f"  [merge_judge] {len(names)} targets")
         judge_dir = chars / "06_merge_judge" / stem
         judges: dict[str, dict] = {}
         for n in names:
@@ -275,7 +365,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
             judges[cname] = r.output
 
         new_targets = core.judge_new_target_names(names, judges)
-        print(f"  [merge_prune] {len(new_targets)} new", flush=True)
+        print(f"  [merge_prune] {len(new_targets)} new")
         prune_dir = chars / "07_merge_prune" / stem
         prunes: dict[str, dict] = {}
         for n in new_targets:
@@ -286,14 +376,14 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
             common.save_result(prune_dir, cname, r)
             prunes[cname] = r.output
 
-        print("  [update_reg_merge]", flush=True)
+        print("  [update_reg_merge]")
         core.update_reg_merge(registry, names, judges, evals, prunes, seq)
 
     # consolidate runs every episode — for ep1 it populates the desc /
     # canonical_name / aliases that update_reg_initial left empty; for ep2+ it
     # folds the merge results.
     ids = core.touched_ids(registry, seq)
-    print(f"  [consolidate] {len(ids)} ids", flush=True)
+    print(f"  [consolidate] {len(ids)} ids")
     cons_dir = chars / "08_consolidate" / stem
     consolidations: dict[str, dict] = {}
     for cid in ids:
@@ -311,14 +401,14 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
     # calls returning new_history=null.
     histories: dict[str, dict] = {}
     if not is_ep1:
-        print(f"  [update_history] {len(ids)} ids", flush=True)
+        print(f"  [update_history] {len(ids)} ids")
         hist_dir = chars / "09_update_history" / stem
         for cid in ids:
             r = core.char_update_history(**ctx, registry=registry, target_id=cid)
             common.save_result(hist_dir, cid, r)
             histories[cid] = r.output
 
-    print("  [update_reg_semantics]", flush=True)
+    print("  [update_reg_semantics]")
     core.update_reg_semantics(registry, consolidations, histories, seq)
 
     # 10_register: snapshot the post-merge registry state for this episode.
@@ -331,11 +421,8 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
     common.dump_json(registry, register_dir / f"{stem}.json")
 
     # summarize ------------------------------------------------------------
-    print("  [summarize]", flush=True)
+    print("  [summarize]")
     summary = core.summarize(**ctx, seq=seq, registry=registry)
     common.save_result(summaries, stem, summary)
 
-    print(
-        f"ep{seq:03d} done {time.perf_counter() - t0:.1f}s registry={len(registry)}",
-        flush=True,
-    )
+    print(f"ep{seq:03d} done {time.perf_counter() - t0:.1f}s registry={len(registry)}")

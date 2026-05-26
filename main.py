@@ -1,9 +1,12 @@
 import json
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 
 from tools import common, fetch_episodes, fetch_model, pipeline
+
+sys.stdout.reconfigure(line_buffering=True)
 
 MODEL = "qwen3-4b"
 EPS = [3, 4, 5]
@@ -17,7 +20,7 @@ def main() -> None:
     _, filename = fetch_model.MODELS[MODEL]
     run_id = datetime.now().strftime("%Y-%m-%d_%H%M")
     out_dir = common.SEMANTIC_SUMMARY_DIR / f"{run_id}_{Path(filename).stem}"
-    print(f"MODEL={filename} EPS={EPS} OUT={out_dir} RESUME_FROM={RESUME_FROM}", flush=True)
+    print(f"MODEL={filename} EPS={EPS} OUT={out_dir} RESUME_FROM={RESUME_FROM}")
 
     registry: dict = {}
     if RESUME_FROM is not None:

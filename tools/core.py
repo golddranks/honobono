@@ -141,17 +141,24 @@ def char_extract_verify_quote(
     target_evidence_excerpt: str,
     model: str,
     max_attempts: int = 3,
+    rejected_excerpts: list[str] | tuple[str, ...] = (),
 ) -> Result:
-    """Per-name mechanical recovery LLM call: given an extract entry
-    whose evidence_excerpt isn't a substring of episode_text, asks the
-    model whether the target is in body at all (in any form) and, if so,
-    to supply a corrected quote.
+    """Per-name "is this character in body, with what excerpt?" recovery.
+    Called from two sites in the pipeline:
+      - mechanical-bad: evidence_excerpt isn't a substring of body.
+      - semantic-bad: excerpt is a substring but verify_semantics rejected
+        it (quote_refers_to_target=false, B-guard, etc.).
 
     Output: `{in_body: bool, correct_evidence_excerpt: str | null, reason}`.
     Pipeline uses the result as:
       in_body=false                       → drop the entry silently.
       in_body=true + valid corrected quote → keep with replaced quote.
       in_body=true + null / invalid quote → crash (insisting case).
+
+    `rejected_excerpts` lists excerpts the caller already knows are
+    inadequate (typically the original extract excerpt that triggered
+    this verification). Surfaced to the model so it doesn't re-propose
+    the same answer.
 
     Internal retry loop (up to `max_attempts`): if the model says
     in_body=true but the corrected_quote isn't a substring of
@@ -163,12 +170,13 @@ def char_extract_verify_quote(
     res: Result | None = None
     for attempt in range(1, max_attempts + 1):
         if attempt > 1:
-            print(f"    [verify_quote internal retry {attempt}/{max_attempts}]", flush=True)
+            print(f"    [verify_quote internal retry {attempt}/{max_attempts}]")
         prompt = prompts.char_extract_verify_quote_prompt(
             episode_text=episode_text,
             target_canonical_name=target_canonical_name,
             target_evidence_excerpt=target_evidence_excerpt,
             failed_corrections=failed_corrections,
+            rejected_excerpts=rejected_excerpts,
         )
         res = _generate_parsed(prompt, model, prompts.VERIFY_QUOTE_SCHEMA, num_predict=500)
         out = res.output
@@ -361,32 +369,29 @@ def extract_quote_mechanical_bad(
 
 
 def build_extract_retry_feedback(
-    bad: list[tuple[str, str]],
     missing: list[str],
     kept_names: list[str],
 ) -> str:
     """Compose a Japanese feedback block for the next extract attempt.
-    Three sections:
-    - `kept_names`: characters that survived the previous verify pass.
-      The next attempt must include them again — the first extract has
-      good recall; retries refine specific problems and shouldn't lose
-      the good ones.
-    - `bad`: per-character advice for problems verify caught
-      (mis-attributed quotes, B guard, etc.).
+    Two sections:
+    - `kept_names`: characters that survived the previous verify pass
+      (including those recovered by verify_quote). The next attempt
+      must include them again — the first extract has good recall;
+      retries refine specific problems and shouldn't lose the good
+      ones.
     - `missing`: characters verify_missing flagged as in body but not
       extracted.
-    Silent drops are not surfaced (verify already handled them)."""
+
+    Excerpt-level problems (mechanical-bad, quote_refers_to_target=false,
+    B-guard) no longer trigger retries — the pipeline recovers those
+    per-entry via verify_quote. Only verify_missing failures (genuine
+    recall gaps) reach this function."""
     lines = ["前回の出力に以下の問題がありました。今回はこれらを必ず直してください。"]
     if kept_names:
         lines.append("")
         lines.append("【前回の出力で正しく抽出できた人物（今回も必ず含めること）】")
         for n in kept_names:
             lines.append(f"- {n}")
-    if bad:
-        lines.append("")
-        lines.append("【evidence_excerpt の問題】")
-        for cname, advice in bad:
-            lines.append(f"- {cname}: {advice}")
     if missing:
         lines.append("")
         lines.append("【本文中で言及されているのに characters に含まれていなかった人物】")

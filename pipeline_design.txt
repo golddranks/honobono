@@ -1,94 +1,73 @@
-(ch1)
+# characters
 
-- char_extract: extracts a character list from ch1
-	- inputs: ch1 text
-	- outputs: character list
-- char_extract_verify: asks if the list is missing any charcters
-	- inputs: character list, ch1 text
-	- outputs: bool -> crash early if false
-- char_update_reg_a (non-LLM)
-	- inputs: character list
-	- outputs: updated character registry
-- summarize: summarizes the ch1
-	- inputs: ch1 text, character registry
-	- outputs: summary text
+## character extract
 
-(ch2)
+- try 3 times, with feedback from failures
 
-- char_extract: extracts a character list from ch2
-	- inputs: ch1 text, character registry, ch2 text
-	- outputs: character list
-- char_extract_verify: asks if the list is missing any charcters
-	- inputs: ch1 text, character list, ch2 text
-	- outputs: bool -> crash early if false
-- loop for characters (tight loop to reuse the query cache)
-	- char_merge_eval: evaluates if character is likely to be same with each character in the registry
-		- inputs: ch1 text, character registry, ch2 text, target character
-		- outputs: eval for each character in the registry
+    - extract: extracts a character list from current text
+        - inputs: earlier summaries, previous text, character registry, current text, retry feedback
+        - outputs: character list
+
+    - for characters with detected invalid evidence (text excerpt)
+        - verify_quote: ask the model whether this character is actually in current text, and if so supply a corrected evidence
+            - inputs: current text, target character (canonical_name + bad excerpt)
+            - outputs: corrected evidence or drop character or crash
+
+    - for characters
+        - verify_semantics: check per-entry that the evidence actually refers to the target, and classify single/collective nouns
+            - inputs: current text, extracted character data
+            - outputs: semantics validity data
+
+    - for characters flagged bad by verify_semantics
+        - verify_quote: try to recover the excerpt or drop the entry
+            - inputs: current text, target character data, rejected_excerpts list
+            - outputs: corrected evidence or drop character or crash
+
+    - verify_missing: scan current text for characters the extract dropped entirely
+        - inputs: current text, current character list
+        - outputs: missing character data (triggers retry if non-empty)
+
+## character merge
+
 - loop for characters
-	- char_merge_prune_candidates (non-LLM): picks only the likely match candidates from the character registry
-		- inputs: character registry, character eval
-		- outputs: pruned character registry
-	- char_merge_judge: judges if the character matches some of the candidates, or is a new character
-		- inputs: ch1 text, target character, pruned character registry, ch2 text
-		- outputs: single-character judgement
-- loop for new characters
-	- char_merge_prune: removes any new characters that are unlikely to be actual characters
-		- inputs: ch1 text, target character, character registry, ch2 text
-		- outputs: pruning decision
-- char_update_reg_b (non-LLM)
-	- inputs: character registry, character list, character judgements, pruning decisions
-	- outputs: updated character registry
-- loop for updated characters:
-	- consolidate_char: consolidates the merged character info (descriptions, canonical name, other names)
-		- inputs: ch1 text, ch2 text, character registry, target_character
-		- outputs: consolidated character info
-	- update_char_history: updates the character identity history with the consolidated character info
-		- inputs: ch1 text, ch2 text, character registry, target_character
-		- outputs: updated character registry
-- char_update_reg_c (non-LLM)
-	- inputs: character registry, character list, character judgements, pruning decisions
-	- outputs: updated character registry
-- summarize: summarizes the ch2
-	- inputs: ch1 text, character registry, ch2 text
-	- outputs: summary text
+    - merge_eval: evaluates if character is likely to be same with each character in the registry
+        - inputs: earlier summaries, previous text, character registry, current text, target character
+        - outputs: per existing canonical_name in the registry, output the likelihood the target character being the same
 
-(ch3 onwards)
-
-- char_extract: extracts a character list from ch3
-	- inputs: earlier summaries, ch2 text, character registry, ch3 text
-	- outputs: character list
-- char_extract_verify: asks if the list is missing any charcters
-	- inputs: earlier summaries, ch2 text, character list, ch3 text
-	- outputs: bool -> crash early if false
-- loop for characters (tight loop to reuse the query cache)
-	- char_merge_eval: evaluates if character is likely to be same with each character in the registry
-		- inputs: earlier summaries, ch2 text, character registry, ch3 text, target character
-		- outputs: eval for each character in the registry
 - loop for characters
-	- char_merge_prune_candidates (non-LLM): picks only the likely match candidates from the character registry
-		- inputs: character registry, character eval
-		- outputs: pruned character registry
-	- char_merge_judge: judges if the character matches some of the candidates, or is a new character
-		- inputs: earlier summaries, ch2 text, target character, pruned character registry, ch3 text
-		- outputs: single-character judgement
-- loop for new characters
-	- char_merge_prune: removes any new characters that are unlikely to be actual characters
-		- inputs: earlier summaries, ch2 text, target character, character registry, ch3 text
-		- outputs: pruning decision
-- char_update_reg_b (non-LLM)
-	- inputs: character registry, character list, character judgements, pruning decisions
-	- outputs: updated character registry
-- loop for updated characters:
-	- consolidate_char: consolidates the merged character info (descriptions, canonical name, other names)
-		- inputs: earlier summaries, ch2 text, ch3 text, character registry, target_character
-		- outputs: consolidated character info
-	- update_char_history: updates the character identity history with new character info
-		- inputs: earlier summaries, ch2 text, ch3 text, character registry, target_character
-		- outputs: updated character registry
-- char_update_reg_c (non-LLM)
-	- inputs: character registry, character list, character judgements, pruning decisions
-	- outputs: updated character registry
-- summarize: summarizes the ch3
-	- inputs: earlier summaries, ch2 text, character registry, ch3 text
-	- outputs: summary text
+    - merge_prune_candidates (non-LLM): picks only the likely match candidates from the character registry
+        - inputs: character registry, character eval
+        - outputs: pruned character registry
+    - merge_judge: judges if the character matches some of the candidates, or is a new character
+        - inputs: earlier summaries, previous text, target character, pruned character registry, current text
+        - outputs: decision which candidate the target character matches (or none)
+
+- loop for characters with no existing-match judgement (i.e. new characters)
+    - merge_prune: removes any new characters that are unlikely to be actual characters
+        - inputs: earlier summaries, previous text, target character, character registry, current text, same-name existing entries (if any)
+        - outputs: decision whether to keep the new character
+
+- update_reg_merge (non-LLM): fold the merge results into the registry
+    - inputs: character registry, character list, character judgements, evals (for multi-true disambiguation), pruning decisions
+    - outputs: updated character registry
+
+## character consolidate (every episode)
+
+- loop for characters touched this episode:
+    - consolidate_char: consolidates the merged character info (descriptions, canonical name, other names)
+        - inputs: earlier summaries, previous text, current text, character registry, target character, surface forms this episode
+        - outputs: updated character registry entry
+
+    - update_history: records identity-level changes (name reveal, role change, etc.)
+        - inputs: earlier summaries, previous text, current text, character registry, target character
+        - outputs: new history entry (or null if no change)
+
+- update_reg_semantics (non-LLM): fold consolidations + history entries into the registry
+    - inputs: character registry, consolidations, histories
+    - outputs: updated character registry
+
+# summary
+
+- summarize: summarizes the current episode
+    - inputs: earlier summaries, previous text, character registry, current text
+    - outputs: summary text (becomes part of "earlier summaries" for later episodes)
