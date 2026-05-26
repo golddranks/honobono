@@ -334,6 +334,14 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
     # Per-stage dicts store .output directly (pipeline never needs the
     # surrounding Result; prompts/metas are already on disk from save_result).
     is_ep1 = not registry
+    # Snapshot aliases per cid before any merge-time mutation. Used after
+    # update_reg_merge to compute the per-entry diff of newly-added
+    # aliases this episode — passed to update_history so the model can
+    # detect identity events (name reveal, role reveal) that show up
+    # only as alias additions.
+    aliases_before: dict[str, set[str]] = {
+        cid: set(e.get("aliases", [])) for cid, e in registry.items()
+    }
     if is_ep1:
         print("  [update_reg_initial]")
         core.update_reg_initial(registry, names, seq)
@@ -376,8 +384,39 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
             common.save_result(prune_dir, cname, r)
             prunes[cname] = r.output
 
+        # merge_confirm: LLM pushback ONLY when prune proposes a merge into
+        # an existing entry that eval ranked unlikely/impossible. The
+        # likely/possible cases are accepted mechanically (eval already
+        # endorsed them as plausible same-person matches). For the
+        # contradiction case the model is shown both stages' verdicts and
+        # asked to commit.
+        confirms: dict[str, dict] = {}
+        contradictions = []
+        for n in new_targets:
+            cname = n["canonical_name"]
+            p = prunes[cname]
+            mt = p.get("merge_into")
+            if p.get("keep") or not mt:
+                continue
+            tier = evals.get(cname, {}).get(mt, {}).get("same_person_as_target", "impossible")
+            if tier in ("impossible", "unlikely"):
+                contradictions.append((n, mt, tier))
+        if contradictions:
+            print(f"  [merge_confirm] {len(contradictions)} pushback proposals")
+            for n, mt, tier in contradictions:
+                cname = n["canonical_name"]
+                r = core.char_merge_confirm(
+                    **ctx,
+                    registry=registry,
+                    target_canonical_name=cname,
+                    target_evidence_excerpt=n["evidence_excerpt"],
+                    proposed_merge_cname=mt,
+                )
+                common.save_result(prune_dir, f"{cname}.confirm", r)
+                confirms[cname] = r.output
+
         print("  [update_reg_merge]")
-        core.update_reg_merge(registry, names, judges, evals, prunes, seq)
+        core.update_reg_merge(registry, names, judges, evals, prunes, confirms, seq)
 
     # consolidate runs every episode — for ep1 it populates the desc /
     # canonical_name / aliases that update_reg_initial left empty; for ep2+ it
@@ -404,7 +443,16 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
         print(f"  [update_history] {len(ids)} ids")
         hist_dir = chars / "09_update_history" / stem
         for cid in ids:
-            r = core.char_update_history(**ctx, registry=registry, target_id=cid)
+            new_aliases = [
+                a for a in registry[cid].get("aliases", [])
+                if a not in aliases_before.get(cid, set())
+            ]
+            r = core.char_update_history(
+                **ctx,
+                registry=registry,
+                target_id=cid,
+                new_aliases_this_episode=new_aliases,
+            )
             common.save_result(hist_dir, cid, r)
             histories[cid] = r.output
 

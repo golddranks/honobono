@@ -24,11 +24,28 @@ def main() -> None:
 
     registry: dict = {}
     if RESUME_FROM is not None:
-        registry = json.loads((RESUME_FROM / "chars" / "registry.json").read_text())
+        first_ep = min(EPS)
+        prev_seq = first_ep - 1
+        if prev_seq < 1:
+            raise SystemExit(
+                f"RESUME_FROM doesn't make sense with EPS starting at {first_ep} "
+                "(nothing to resume from before ep1)"
+            )
+        snap = RESUME_FROM / "chars" / "10_register"
+        matches = sorted(snap.glob(f"{prev_seq:03d}_*.json"))
+        if not matches:
+            raise SystemExit(f"no registry snapshot for ep{prev_seq} in {snap}")
+        registry = json.loads(matches[0].read_text())
         src_summaries = RESUME_FROM / "summaries"
         dst_summaries = out_dir / "summaries"
         dst_summaries.mkdir(parents=True, exist_ok=True)
         for f in src_summaries.iterdir():
+            # Filenames are zero-padded with the episode seq (e.g.
+            # "004_n9629ex_ep004.json"). Only copy summaries for episodes
+            # strictly before first_ep — anything later would correspond
+            # to episodes we're about to re-process.
+            if f.name[:3].isdigit() and int(f.name[:3]) >= first_ep:
+                continue
             shutil.copy2(f, dst_summaries / f.name)
 
     for seq in EPS:

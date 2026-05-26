@@ -528,6 +528,41 @@ def collapse_multi_judge(
     return top
 
 
+def char_merge_confirm(
+    *,
+    episode_text: str,
+    prev_episode_text: str,
+    prior_summaries: list[str],
+    registry: dict,
+    target_canonical_name: str,
+    target_evidence_excerpt: str,
+    proposed_merge_cname: str,
+    model: str,
+) -> Result:
+    """Final-pushback identity check for an eval-vs-prune contradiction.
+    Output: `{target, evidence, same_person_as_target: bool}`. Called
+    only when prune proposes merging into an existing entry that eval
+    marked unlikely/impossible — the pipeline asks one more LLM pass
+    to break the tie. Prune's reason is deliberately omitted from the
+    prompt (it can be inconsistent with prune's actual merge_into when
+    the grammar enum overrode the model's intent); confirm decides
+    fresh from body + registry."""
+    cname_to_entry = {e["canonical_name"]: e for e in registry.values()}
+    proposed_entry = cname_to_entry.get(proposed_merge_cname, {})
+    prompt = prompts.char_merge_confirm_prompt(
+        episode_text=episode_text,
+        prev_episode_text=prev_episode_text,
+        prior_summaries=prior_summaries,
+        registry=registry,
+        target_canonical_name=target_canonical_name,
+        target_evidence_excerpt=target_evidence_excerpt,
+        proposed_merge_cname=proposed_merge_cname,
+        proposed_merge_entry=proposed_entry,
+    )
+    schema = prompts.merge_confirm_schema(target_canonical_name)
+    return _generate_parsed(prompt, model, schema, num_predict=1000)
+
+
 def char_merge_prune(
     *,
     episode_text: str,
@@ -591,9 +626,13 @@ def char_update_history(
     registry: dict,
     target_id: str,
     model: str,
+    new_aliases_this_episode: list[str] = (),
 ) -> Result:
     """Per-target identity-change history entry. Output: `{new_history, reason}`.
-    `new_history` is null when no identity change occurred."""
+    `new_history` is null when no identity change occurred.
+    `new_aliases_this_episode` is computed by the caller (pipeline) as
+    the diff between the entry's pre-merge and post-merge aliases — a
+    strong hint that a name/role reveal happened this episode."""
     prompt = prompts.char_update_history_prompt(
         episode_text=episode_text,
         prev_episode_text=prev_episode_text,
@@ -601,6 +640,7 @@ def char_update_history(
         registry=registry,
         target_id=target_id,
         target_entry=registry[target_id],
+        new_aliases_this_episode=new_aliases_this_episode,
     )
     return _generate_parsed(prompt, model, prompts.CHAR_UPDATE_HISTORY_SCHEMA, num_predict=1000)
 
@@ -677,6 +717,7 @@ def update_reg_merge(
     judgements: dict[str, dict],
     evals: dict[str, dict],
     prunings: dict[str, dict],
+    confirms: dict[str, dict],
     seq: int,
 ) -> dict:
     """Ep2+: fold per-target merge judgements + per-new-target prunings.
@@ -697,9 +738,14 @@ def update_reg_merge(
         add surface forms to entry.aliases, append seq.
       0 existing matches (or none resolved):
         prunings[cname].keep == true                → allocate fresh id.
-        keep == false AND merge_into = <existing>   → add as alias of
-          that existing entry (prune-driven recovery from judge errors
-          on name-reveal patterns).
+        keep == false AND merge_into = <existing>   → eval-gated:
+          eval tier likely/possible   → accept merge as alias (no
+            extra check; eval already considered them potentially the
+            same person).
+          eval tier unlikely/impossible → eval contradicts the merge
+            claim. Use the pushback verdict in `confirms[cname]`: if
+            same_person_as_target=true, honor the merge anyway; else
+            reject and allocate a fresh id.
         keep == false AND merge_into = null         → silent drop.
     """
     cname_to_id = _cname_to_id(registry)
@@ -718,6 +764,22 @@ def update_reg_merge(
                 continue
             merge_target = prune.get("merge_into")
             if merge_target and merge_target in cname_to_id:
+                eval_tier = (
+                    evals.get(cname, {})
+                    .get(merge_target, {})
+                    .get("same_person_as_target", "impossible")
+                )
+                if eval_tier in ("impossible", "unlikely"):
+                    confirm = confirms.get(cname)
+                    if not (confirm and confirm.get("same_person_as_target")):
+                        print(
+                            f"  [update_reg_merge] merge_confirm rejected "
+                            f"{cname!r} → {merge_target!r} (eval tier={eval_tier!r}); "
+                            f"allocating new entry"
+                        )
+                        max_id = _allocate_entry(registry, item, seq, max_id)
+                        cname_to_id[cname] = max_id
+                        continue
                 resolved = [cname_to_id[merge_target]]
             else:
                 continue  # silent drop

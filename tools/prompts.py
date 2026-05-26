@@ -703,6 +703,93 @@ JSONのみを出力すること。形式は以下のように。
 """
 
 
+# --------------------------------------------------------------- merge_confirm
+
+
+def char_merge_confirm_prompt(
+    *,
+    episode_text: str,
+    prev_episode_text: str,
+    prior_summaries: list[str],
+    registry: dict,
+    target_canonical_name: str,
+    target_evidence_excerpt: str,
+    proposed_merge_cname: str,
+    proposed_merge_entry: dict,
+) -> str:
+    """Per-merge-proposal final-pushback check, invoked only when prune's
+    merge_into is eval-tier unlikely/impossible — i.e. when prune
+    contradicts eval. Phrased as a clean binary same-person question:
+    target X vs candidate Y; body + registry as evidence.
+
+    Note: prune's `reason` is deliberately NOT included here. When prune
+    hallucinates an existing target (e.g. "既存の人物「村長」が存在する"
+    when registry has no 村長) the grammar enum overrides the model's
+    intended merge_into to a different existing name via prefix bias,
+    leaving the reason text inconsistent with the actual merge_into.
+    Showing that inconsistent reason to confirm makes the weak model
+    copy it verbatim and propagate the hallucination."""
+    plot = summaries(prior_summaries)
+    reg_block = render_registry(registry)
+    prev = prev_episode_text_block(prev_episode_text)
+    target_block = (
+        "\n<判定対象>\n"
+        f"canonical_name: {target_canonical_name}\n"
+        f"evidence_excerpt: {target_evidence_excerpt}\n"
+        "</判定対象>\n"
+    )
+    proposed_block = (
+        "\n<統合候補>\n"
+        + json.dumps(
+            {proposed_merge_cname: _slim_entry(proposed_merge_entry)},
+            ensure_ascii=False,
+            indent=1,
+        )
+        + "\n</統合候補>\n"
+    )
+    return f"""人物統合の最終確認。
+
+判定対象（今回新しく抽出された人物）と、統合候補（既存の人物のうちの一人）が
+同じ人物かを、本文と既存情報をもとに判定してください。
+
+ルール:
+- target は判定対象の canonical_name をそのまま書く。
+- evidence は本文・前回の本文・あらすじ・既存の人物情報を根拠にする。
+  明示的な手がかり（呼び名・役割・関係・状況）を引用する。
+- same_person_as_target=true なら、判定対象は「統合候補」と同一人物であり、
+  そのエイリアスとして統合される。
+- same_person_as_target=false なら、判定対象は別人として新規登録される。
+- 「私」など語り手の一人称は、本文の語り手その人が誰なのかを慎重に考える。
+{plot}{reg_block}{prev}{proposed_block}{target_block}
+<本文>
+{episode_text}
+</本文>
+
+JSONのみを出力すること。形式は以下のように。
+{{
+    "target": "{target_canonical_name}",
+    "evidence": "判定の根拠",
+    "same_person_as_target": true または false
+}}
+"""
+
+
+def merge_confirm_schema(target_canonical_name: str):
+    """`target` is const-echoed (same anti-confusion trick as merge_judge).
+    Field order: target → evidence → same_person_as_target so the model
+    commits the boolean after writing the rationale."""
+    return {
+        "type": "object",
+        "properties": {
+            "target": {"const": target_canonical_name},
+            "evidence": {"type": "string", "maxLength": 500},
+            "same_person_as_target": {"type": "boolean"},
+        },
+        "required": ["target", "evidence", "same_person_as_target"],
+        "additionalProperties": False,
+    }
+
+
 def merge_prune_schema(existing_cnames: list[str]):
     """Per-new-target keep/merge/drop verdict. `merge_into` is constrained
     to an existing canonical_name (or null) so the model can't invent
@@ -815,9 +902,18 @@ def char_update_history_prompt(
     registry: dict,
     target_id: str,
     target_entry: dict,
+    new_aliases_this_episode: list[str] = (),
 ) -> str:
     """Per-target identity-change history entry. Only identity changes —
-    not story events. Output may be null."""
+    not story events. Output may be null.
+
+    `new_aliases_this_episode` lists aliases that were added to this
+    entry by THIS episode's merge stage (not present in the pre-merge
+    snapshot of the entry's aliases). A non-empty list strongly hints
+    at an identity event (name reveal, role reveal) — without this
+    signal the model sees the alias already in the entry and defaults
+    to "no change". The list is surfaced in `<対象人物>` and an
+    explicit rule tells the model to record the corresponding event."""
     plot = summaries(prior_summaries)
     reg_block = render_registry(registry)
     prev = prev_episode_text_block(prev_episode_text)
@@ -828,6 +924,7 @@ def char_update_history_prompt(
                 "id": target_id,
                 "canonical_name": target_entry.get("canonical_name", ""),
                 "aliases": target_entry.get("aliases", []),
+                "new_aliases_this_episode": list(new_aliases_this_episode),
                 "desc": target_entry.get("desc", ""),
                 "history": target_entry.get("history", []),
             },
@@ -835,6 +932,13 @@ def char_update_history_prompt(
             indent=1,
         )
         + "\n</対象人物>\n"
+    )
+    new_alias_rule = (
+        "- `new_aliases_this_episode` が空でない場合、今回のエピソードで対象人物に新たな呼び名が"
+        "付いた・本名や別名が判明したことを意味する。<本文> を読んでその同一性イベントを"
+        "特定し、new_history に記録すること（典型例: 本名判明、あだ名付与、役職・身分の判明）。\n"
+        if new_aliases_this_episode
+        else ""
     )
     return f"""人物の同一性に関する変化の記録（一人ずつ）。
 
@@ -858,7 +962,7 @@ def char_update_history_prompt(
 - 同一性に関する変化があれば new_history に一文で記録（80文字以内）。
 - なければ new_history は null。
 - 該当する変化が複数ある場合は最も重要な一つだけ。
-- reason に判定の根拠（変化の根拠 / なぜ無いのか）を短く書く。
+{new_alias_rule}- reason に判定の根拠（変化の根拠 / なぜ無いのか）を短く書く。
 {plot}{reg_block}{prev}{target_block}
 <本文>
 {episode_text}
