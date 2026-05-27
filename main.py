@@ -9,7 +9,7 @@ sys.stdout.reconfigure(line_buffering=True)  # pyright: ignore[reportAttributeAc
 
 # Each model is run from scratch over `EPS`. If a model crashes mid-run,
 # the loop moves on to the next model. Use Ctrl-C to stop the batch.
-MODELS_TO_RUN = ["gemma3-27b", "qwen3-32b"]
+MODELS_TO_RUN = ["gemma4-31b"]
 EPS = list(range(1, 17))
 
 

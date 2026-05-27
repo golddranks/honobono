@@ -1,6 +1,7 @@
 """Idempotent GGUF downloader. CLI takes one or more model names from MODELS
 (defaults to "qwen3-4b"). Each download is atomic — written to a `.tmp` sibling
-and renamed on success.
+and renamed on success. Interrupted downloads resume from the `.tmp` size via
+an HTTP Range request on the next invocation.
 
 Usage:
   uv run python -m tools.fetch_model                  # downloads "qwen3-4b"
@@ -52,6 +53,10 @@ MODELS: dict[str, tuple[str, str]] = {
         f"{HF}/Qwen/Qwen3-32B-GGUF/resolve/main/Qwen3-32B-Q8_0.gguf",
         "Qwen3-32B-Q8_0.gguf",
     ),
+    "qwen3.6-27b": (
+        f"{HF}/unsloth/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q8_0.gguf",
+        "Qwen3-27B-Q8_0.gguf",
+    ),
     "gemma3-12b": (
         f"{HF}/google/gemma-3-12b-it-qat-q4_0-gguf/resolve/main/gemma-3-12b-it-q4_0.gguf",
         "gemma-3-12b-it-q4_0.gguf",
@@ -59,6 +64,10 @@ MODELS: dict[str, tuple[str, str]] = {
     "gemma3-27b": (
         f"{HF}/google/gemma-3-27b-it-qat-q4_0-gguf/resolve/main/gemma-3-27b-it-q4_0.gguf",
         "gemma-3-27b-it-q4_0.gguf",
+    ),
+    "gemma4-31b": (
+        f"{HF}/unsloth/gemma-4-31B-it-GGUF/resolve/main/gemma-4-31B-it-UD-Q8_K_XL.gguf",
+        "gemma-4-31b-it-q8_0.gguf",
     ),
 }
 
@@ -73,10 +82,20 @@ def download(url: str, dest: Path) -> None:
     headers = {"User-Agent": "honobono-fetch/1"}
     if token := _hf_token():
         headers["Authorization"] = f"Bearer {token}"
+
+    resume_from = tmp.stat().st_size if tmp.exists() else 0
+    if resume_from:
+        headers["Range"] = f"bytes={resume_from}-"
+        print(f"  resuming from {resume_from >> 20} MiB", flush=True)
+
     req = urllib.request.Request(url, headers=headers)
     try:
         resp_cm = urllib.request.urlopen(req, timeout=120)
     except urllib.error.HTTPError as e:
+        if e.code == 416:
+            # tmp is at least as large as the remote file — discard and restart.
+            tmp.unlink(missing_ok=True)
+            return download(url, dest)
         if e.code in (401, 403):
             raise SystemExit(
                 f"HTTP {e.code} on {url}\n"
@@ -86,10 +105,18 @@ def download(url: str, dest: Path) -> None:
             ) from e
         raise
     with resp_cm as resp:
-        total = int(resp.headers.get("Content-Length") or 0)
-        got = 0
-        next_mark = PROGRESS_EVERY
-        with tmp.open("wb") as f:
+        # Server ignored Range — restart from byte 0.
+        if resume_from and resp.status != 206:
+            resume_from = 0
+        if resp.status == 206:
+            cr = resp.headers.get("Content-Range", "")
+            clen = int(resp.headers.get("Content-Length") or 0)
+            total = int(cr.rsplit("/", 1)[-1]) if "/" in cr else resume_from + clen
+        else:
+            total = int(resp.headers.get("Content-Length") or 0)
+        got = resume_from
+        next_mark = (got // PROGRESS_EVERY + 1) * PROGRESS_EVERY
+        with tmp.open("ab" if resume_from else "wb") as f:
             while True:
                 buf = resp.read(CHUNK)
                 if not buf:
@@ -101,8 +128,15 @@ def download(url: str, dest: Path) -> None:
                     print(f"  {got >> 20} MiB / {total >> 20} MiB{pct}", flush=True)
                     next_mark += PROGRESS_EVERY
     if total and got != total:
-        tmp.unlink(missing_ok=True)
+        # Keep tmp around so the next call can resume.
         raise RuntimeError(f"short read: got {got} of {total} bytes")
+    with tmp.open("rb") as f:
+        magic = f.read(4)
+    if magic != b"GGUF":
+        # Corrupt download (e.g. leading zeros). Resume can't repair the
+        # head, so discard and force a fresh fetch next call.
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"bad GGUF magic in {tmp.name}: {magic!r}")
     tmp.rename(dest)
 
 
