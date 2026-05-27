@@ -76,7 +76,6 @@ def _get_llm(model: str, num_ctx: int):
     if _llm is not None and _llm_path == path and _llm_n_ctx == num_ctx:
         return _llm
     _llm = None  # drop reference so the old model can be freed
-    print(f"    [load] {path.name} n_ctx={num_ctx}", flush=True)
     _llm = Llama(
         model_path=str(path),
         n_ctx=num_ctx,
@@ -86,6 +85,63 @@ def _get_llm(model: str, num_ctx: int):
     _llm_path = path
     _llm_n_ctx = num_ctx
     return _llm
+
+
+def chat_generate(
+    messages: list[dict],
+    model: str,
+    *,
+    temperature: float = 0.0,
+    num_ctx: int = 32768,
+    num_predict: int = 2000,
+    fmt: dict | Literal["json"] | None = None,
+) -> Result:
+    """One `create_chat_completion` call against the singleton llama.cpp
+    instance. Caller owns `messages` — append the assistant reply and the
+    next user turn between calls. llama.cpp's automatic KV-cache prefix
+    reuse means each call only evaluates the new tokens at the tail; a
+    long chat is roughly as cheap as one big single-prompt run.
+
+    `prompt` on the returned Result is a flattened text snapshot of the
+    full message list at call time (so save_result writes a readable
+    trace). `output` is the assistant's reply text."""
+    llm = _get_llm(model, num_ctx)
+
+    grammar = None
+    if fmt is not None:
+        from llama_cpp import LlamaGrammar
+
+        schema = fmt if isinstance(fmt, dict) else {"type": "object"}
+        grammar = LlamaGrammar.from_json_schema(json.dumps(schema), verbose=False)
+
+    t0 = time.perf_counter_ns()
+    resp = llm.create_chat_completion(
+        messages=messages,
+        max_tokens=num_predict,
+        temperature=temperature,
+        grammar=grammar,
+    )
+    elapsed_ns = time.perf_counter_ns() - t0
+
+    choice = resp["choices"][0]
+    text = (choice["message"].get("content") or "").strip()
+    if not text:
+        raise RuntimeError(f"empty response: {resp}")
+    done = choice["finish_reason"]
+    usage = resp["usage"]
+    pin = usage["prompt_tokens"]
+    eout = usage["completion_tokens"]
+    prompt_text = "\n\n".join(
+        f"<{m['role']}>\n{m['content']}\n</{m['role']}>" for m in messages
+    )
+    meta = {
+        "model": str(_llm_path),
+        "done_reason": done,
+        "total_duration_ns": elapsed_ns,
+        "prompt_eval_count": pin,
+        "eval_count": eout,
+    }
+    return Result(prompt=prompt_text, meta=meta, output=text)
 
 
 def generate(
@@ -127,15 +183,6 @@ def generate(
     usage = resp["usage"]
     pin = usage["prompt_tokens"]
     eout = usage["completion_tokens"]
-    pct = pin / num_ctx * 100
-    warn = " !!INPUT-NEAR-CTX" if pin >= num_ctx * 0.95 else ""
-    if done == "length":
-        warn += " !!OUTPUT-TRUNCATED"
-    print(
-        f"    [gen] prompt={pin}/{num_ctx} ({pct:.0f}%) "
-        f"eval={eout}/{num_predict} done={done}{warn}",
-        flush=True,
-    )
     meta = {
         "model": str(_llm_path),
         "done_reason": done,

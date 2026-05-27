@@ -1,6 +1,7 @@
 """LLM prompts and output JSON schemas for the chars pipeline."""
 
 import json
+from collections.abc import Sequence
 
 _RENDER_DROP_KEYS = {"seen_in", "canonical_name"}  # bookkeeping + redundant (now key)
 NEW_CHAR_KEY = "新規"
@@ -167,6 +168,114 @@ CHAR_EXTRACT_SCHEMA = {
 }
 
 
+# ------------------------------------------------------------ extract_per_sentence
+# Alternative to char_extract: feed sentences one at a time over a stateful
+# chat conversation. Each turn returns persons present in that one sentence.
+# Pronouns and references resolve via the chat history (prior turns ARE the
+# context). Aggregation back to the CHAR_EXTRACT shape happens in core.
+
+EXTRACT_PER_SENTENCE_SYSTEM = """あなたは小説のテキストから人物を抽出するアシスタントです。
+
+これからユーザーが小説の本文を一文ずつ送ります。各文について、その文に
+登場する人物（明示的に書かれているものも、文脈から推測できるものも）を
+JSON で返してください。
+
+ルール:
+- 「人物」とは、一人の人間・人型存在・神・精霊など、人格を持つ個別の存在。
+  スキル名・能力名・職業名そのもの・場所・物・概念は含めない。
+- 表記は本文に書かれているそのままの呼び方を使う（正規化しない）。
+  省略されている人物は、文脈から特定できる呼び方（直前の文で使われた名前、
+  一人称「私」など）で書く。
+- 代名詞や指示語（「彼」「彼女」「あの人」「この人」など）は、これまでの
+  文脈から指している人物が特定できる場合、その人物の名前で書く。文脈からも
+  特定できない場合は代名詞そのままで書く。一人称（「私」「俺」「僕」など）
+  はその表記のままで構わない。
+- 「両親」「兄と姉」「村人たち」のような複数を指す総称が出てきた場合、個別に
+  分けられる場合は分けて書く（例: 「両親」→「母」と「父」を別々に）。分け
+  られない不特定多数（「村人たち」など）はそのまま一つの要素として書く。
+
+- **重要: 一文中の人物は省略された者も含めて全員を必ず列挙する。**
+  日本語では行為者・受け手・経験者の主語が頻繁に省略される。各文について、
+  以下の問いを必ず確認すること:
+    1. この文に動詞があるか → その動作主（主語）は誰か？
+       文中に語がなくても、文脈から特定できれば含める。
+    2. 受動文・〜される/られる があるか → された側・する側の両方を確認し、
+       両方を含める（一方が文中に書かれていなくても）。
+    3. 「〜から/に 聞いた/見た/もらった/言われた」のように相手が示される場合、
+       その動作の主体（聞いた人・見た人・もらった人）も含める。
+    4. 感情・感覚・思考の表現があるか → その主体は誰か？
+       文中に語がなくても、文脈から特定できれば含める。
+  例: 「母と父の顔を見る。」
+       → 私 (acts: 見る主体), 母 (is_acted_upon: 見られる対象),
+         父 (is_acted_upon)
+  例: 「村の占い師から聞いた。」
+       → 占い師 (acts: 話す主体), 私 (is_acted_upon: 聞く主体)
+  例: 「両親に心配された。」
+       → 母 (acts: 心配する主体), 父 (acts),
+         私 (is_acted_upon: 心配される対象)
+
+- role は以下から一つ選ぶ:
+    speaks         : 発言している（「」内のセリフの話者）
+    thinks         : 内心で思考・独白している
+    feels          : 感情・感覚を抱いている（嬉しい・悲しい・痛い・空腹など）
+    acts           : 何らかの能動的な行動をしている
+    is_acted_upon  : 何かをされる側（受動文の主語、〜てもらう/くれる の受け手など）
+    participates   : 出来事・場面に居合わせている／関わっているが主体ではない
+                     （「一緒に」「傍らに」など、行為や発言の中心ではない）
+    mentioned      : 単に言及・参照されているだけ（行動・発言・感情の主体ではない）
+    other          : 上記のいずれにも当てはまらない
+  一人の人物に複数当てはまる場合、より能動的・内面的なものを優先する
+  （thinks > speaks > feels > acts > is_acted_upon > participates > mentioned）。
+  other は最後の手段。
+
+- その文に人物が一人もいなければ persons は空配列 []。
+
+出力形式:
+{
+  "persons": [
+    {
+      "name": "本文中の表記または文脈から特定した呼び方",
+      "role": "speaks|thinks|feels|acts|is_acted_upon|participates|mentioned|other"
+    }
+  ]
+}
+"""
+
+
+EXTRACT_PER_SENTENCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "persons": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "maxLength": 100},
+                    "role": {
+                        "type": "string",
+                        "enum": [
+                            "speaks",
+                            "thinks",
+                            "feels",
+                            "acts",
+                            "is_acted_upon",
+                            "participates",
+                            "mentioned",
+                            "other",
+                        ],
+                    },
+                },
+                "required": ["name", "role"],
+                "additionalProperties": False,
+            },
+            "maxItems": 20,
+        }
+    },
+    "required": ["persons"],
+    "additionalProperties": False,
+}
+
+
 # --------------------------------------------------------- extract_verify ---
 #
 # Two-step verify, both restricted to the current episode_text (no registry /
@@ -211,6 +320,15 @@ def char_extract_verify_semantics_prompt(
   evidence_excerpt の文脈で一人の人物を指していれば「人物」と判断する。
   能力・スキル・職業名そのものが言及されている場合は、たとえそれを所有する人物がいても「スキル能力職業役職」とする。
 
+- category_evidence : 上の category 判断の根拠となる本文中の一文を、完全一致で引用する。
+  evidence_excerpt とは別の文でよい（同じ文を再引用してもよい）。本文に書かれていない
+  文や要約・言い換えは不可。category の根拠となる文が本文中に存在しない場合は
+  category="その他" とし、本文から該当判定対象に最も関係の深い一文を引用する。
+  例: 判定対象="テイマー"、本文に「テイマーは、動物や魔物を手なずける事が出来るスキル。」がある
+      → category="スキル能力職業役職"、category_evidence="テイマーは、動物や魔物を手なずける事が出来るスキル。"
+  例: 判定対象="母"、本文に「母と父の顔を見る。」しかない場合
+      → category="人物"、category_evidence="母と父の顔を見る。"
+
 - is_single : 判定対象（canonical_name）が一人の特定の人物を指す呼び方なら true。
   canonical_name 自体が複数を同時に指す呼び名（「両親」「兄と姉」「村人たち」など）の場合のみ false。
   evidence_excerpt の文中に他の人物名が一緒に書かれていても判定基準にしない。
@@ -235,6 +353,7 @@ JSONのみを出力すること。形式は以下のように。
     "quote_in_text": true または false,
     "quote_refers_to_target": true または false,
     "category": "人物" | "場所世界" | "物道具" | "スキル能力職業役職" | "概念状態属性" | "群衆総称" | "その他",
+    "category_evidence": "category の根拠となる本文中の一文（完全一致）",
     "is_single": true または false,
     "split_into": ["構成員1", "構成員2"] または [],
     "reason": "判定の根拠"
@@ -248,6 +367,7 @@ VERIFY_SEMANTICS_SCHEMA = {
         "quote_in_text": {"type": "boolean"},
         "quote_refers_to_target": {"type": "boolean"},
         "category": {"type": "string", "enum": CATEGORY_ENUM},
+        "category_evidence": {"type": "string", "maxLength": 500},
         "is_single": {"type": "boolean"},
         "split_into": {
             "type": "array",
@@ -260,6 +380,7 @@ VERIFY_SEMANTICS_SCHEMA = {
         "quote_in_text",
         "quote_refers_to_target",
         "category",
+        "category_evidence",
         "is_single",
         "split_into",
         "reason",
@@ -902,7 +1023,7 @@ def char_update_history_prompt(
     registry: dict,
     target_id: str,
     target_entry: dict,
-    new_aliases_this_episode: list[str] = (),
+    new_aliases_this_episode: Sequence[str] = (),
 ) -> str:
     """Per-target identity-change history entry. Only identity changes —
     not story events. Output may be null.

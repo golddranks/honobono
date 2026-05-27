@@ -5,12 +5,12 @@ from pathlib import Path
 
 from tools import common, fetch_episodes, fetch_model, pipeline
 
-sys.stdout.reconfigure(line_buffering=True)
+sys.stdout.reconfigure(line_buffering=True)  # pyright: ignore[reportAttributeAccessIssue]
 
 # Each model is run from scratch over `EPS`. If a model crashes mid-run,
 # the loop moves on to the next model. Use Ctrl-C to stop the batch.
-MODELS_TO_RUN = ["qwen3-4b", "qwen3-8b", "qwen3-14b", "gemma3-27b", "qwen3-32b"]
-EPS = list(range(1, 11))
+MODELS_TO_RUN = ["gemma3-27b", "qwen3-32b"]
+EPS = list(range(1, 17))
 
 
 def main() -> None:

@@ -275,7 +275,12 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
                 # drops (category != 人物, unsplittable collective), or
                 # the model deciding the corrected excerpt is a different
                 # character / collective → drop the entry.
-                if fail is not None or drop is not None or len(persons) != 1 or persons[0]["canonical_name"] != cname:
+                if (
+                    fail is not None
+                    or drop is not None
+                    or len(persons) != 1
+                    or persons[0]["canonical_name"] != cname
+                ):
                     sem_drops.append(cname)
                     continue
                 entry["evidence_excerpt"] = corrected
@@ -403,7 +408,7 @@ def run_episode(seq: int, registry: dict, *, model: str, out_dir: Path) -> None:
                 contradictions.append((n, mt, tier))
         if contradictions:
             print(f"  [merge_confirm] {len(contradictions)} pushback proposals")
-            for n, mt, tier in contradictions:
+            for n, mt, _tier in contradictions:
                 cname = n["canonical_name"]
                 r = core.char_merge_confirm(
                     **ctx,

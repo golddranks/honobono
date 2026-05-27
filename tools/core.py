@@ -13,6 +13,7 @@ carrier, save_result) live in common.py.
 """
 
 import json
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -50,9 +51,7 @@ def _find_name(names: list[dict], cname: str) -> dict:
 
 def _generate_parsed(prompt: str, model: str, fmt: dict, num_predict: int) -> Result:
     """Call generate and json.loads the raw text into Result.output."""
-    res = common.generate(
-        prompt=prompt, model=model, fmt=fmt, num_predict=num_predict, **BASE_OPTS
-    )
+    res = common.generate(prompt=prompt, model=model, fmt=fmt, num_predict=num_predict, **BASE_OPTS)
     res.output = json.loads(res.output)
     return res
 
@@ -105,6 +104,66 @@ def extract_persons(extract_output: dict) -> list[dict]:
     """Filter `char_extract` output to entries with category == "人物".
     These are the names the rest of the pipeline operates on."""
     return [c for c in extract_output["characters"] if c["category"] == prompts.PERSON_CATEGORY]
+
+
+# --- per-sentence extract (01b alternative) -------------------------------
+
+_SENT_OPEN = "「『（≪【"
+_SENT_CLOSE = "」』）≫】"
+_SENT_END = "。！？!?"
+
+
+def split_episode_sentences(text: str) -> list[str]:
+    """Split Japanese text into sentences. Bracketed regions (「」『』≪≫
+    （）【】) are kept intact — a period inside dialog does not end a
+    sentence. Sentence boundaries: a sentence-ending punctuation at bracket
+    depth 0, or a newline at bracket depth 0. Empty/whitespace-only
+    segments are dropped."""
+    sentences: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    for ch in text:
+        buf.append(ch)
+        if ch in _SENT_OPEN:
+            depth += 1
+        elif ch in _SENT_CLOSE:
+            depth = max(0, depth - 1)
+        elif depth == 0 and (ch in _SENT_END or ch == "\n"):
+            s = "".join(buf).strip()
+            if s:
+                sentences.append(s)
+            buf = []
+    tail = "".join(buf).strip()
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+def char_extract_per_sentence(
+    *,
+    episode_text: str,
+    model: str,
+) -> Iterator[dict]:
+    """Alternative to `char_extract`. Splits the episode into sentences and
+    feeds them to a stateful chat conversation one at a time (KV cache
+    reuse). Yields one `{sentence, persons}` per turn, in order. The caller
+    drives the loop and decides what to do with each result (print, save,
+    aggregate, break early)."""
+    sentences = split_episode_sentences(episode_text)
+    messages: list[dict] = [
+        {"role": "system", "content": prompts.EXTRACT_PER_SENTENCE_SYSTEM},
+    ]
+    for sentence in sentences:
+        messages.append({"role": "user", "content": sentence})
+        r = common.chat_generate(
+            messages,
+            model,
+            fmt=prompts.EXTRACT_PER_SENTENCE_SCHEMA,
+            num_predict=500,
+        )
+        parsed = json.loads(r.output)
+        messages.append({"role": "assistant", "content": r.output})
+        yield {"sentence": sentence, "persons": parsed["persons"]}
 
 
 def char_extract_verify_semantics(
@@ -236,6 +295,10 @@ def verify_semantics_resolve(
       - evidence_excerpt is not a literal substring of episode_text
       - LLM said quote_in_text=false
       - LLM said quote_refers_to_target=false
+      - category_evidence is not a literal substring of episode_text
+        (forces the model to ground category in a concrete sentence;
+        if it can't, the classification is unreliable and the entry
+        is rejected for re-extract via verify_quote recovery)
       - B guard: target canonical_name appears inside split_into
 
     Silent-drop conditions (verify rescuing extract):
@@ -256,6 +319,8 @@ def verify_semantics_resolve(
         return [], None, "quote_in_text=false"
     if not per_name["quote_refers_to_target"]:
         return [], None, "quote_refers_to_target=false"
+    if not quote_in_episode_text(per_name["category_evidence"], episode_text):
+        return [], None, "category_evidence not a substring of episode_text"
 
     if per_name["is_single"]:
         if per_name["category"] != prompts.PERSON_CATEGORY:
@@ -269,14 +334,18 @@ def verify_semantics_resolve(
         # split_into=["母","父"] for canonical_name="母".
         if name["canonical_name"] in per_name["split_into"]:
             return [], None, "split_into contains target canonical_name itself"
-        return [
-            {
-                "canonical_name": s,
-                "evidence_excerpt": name["evidence_excerpt"],
-                "category": prompts.PERSON_CATEGORY,
-            }
-            for s in per_name["split_into"]
-        ], None, None
+        return (
+            [
+                {
+                    "canonical_name": s,
+                    "evidence_excerpt": name["evidence_excerpt"],
+                    "category": prompts.PERSON_CATEGORY,
+                }
+                for s in per_name["split_into"]
+            ],
+            None,
+            None,
+        )
 
     return [], "is_single=false and split_into empty (unsplittable collective)", None
 
@@ -379,14 +448,14 @@ def extract_quote_mechanical_bad(
             advice = (
                 f"前回書いた evidence_excerpt「{quote}」は <{source}> 内の文字列です。"
                 f"<{source}> から引用してはいけません。"
-                f"今回の <本文> を読み直し、{cname} への言及をその中から見つけて、その実在する箇所を引用してください。"
-                f"もし {cname} が <本文> 中で全く言及されていなければ、過去の話に出ただけの人物として characters から外してください。"
+                f"今回の <本文> を読み直し、{cname} への言及をその中から見つけて、その実在する箇所を引用してください。"  # noqa: E501
+                f"もし {cname} が <本文> 中で全く言及されていなければ、過去の話に出ただけの人物として characters から外してください。"  # noqa: E501
             )
         else:
             advice = (
                 f"前回書いた evidence_excerpt「{quote}」は <本文> 内に存在しません。"
-                f"要約・言い換え・連結ではなく、<本文> の中に文字どおりに現れる文字列をそのまま引用してください。"
-                f"もし {cname} が <本文> 中で全く言及されていなければ、characters から外してください。"
+                f"要約・言い換え・連結ではなく、<本文> の中に文字どおりに現れる文字列をそのまま引用してください。"  # noqa: E501
+                f"もし {cname} が <本文> 中で全く言及されていなければ、characters から外してください。"  # noqa: E501
             )
         bad.append((cname, advice))
     return bad
@@ -421,7 +490,7 @@ def build_extract_retry_feedback(
         lines.append("【本文中で言及されているのに characters に含まれていなかった人物】")
         for m in missing:
             lines.append(
-                f"- 「{m}」は <本文> 中で言及されていますが、前回の characters には含まれていませんでした。"
+                f"- 「{m}」は <本文> 中で言及されていますが、前回の characters には含まれていませんでした。"  # noqa: E501
                 f"今回は必ず含めてください。"
             )
     return "\n".join(lines)
@@ -490,7 +559,8 @@ def judge_existing_cnames(judge_output: dict) -> list[str]:
     """Candidate canonical_names the judge marked same_person_as_target=true.
     Excludes the virtual NEW_CHAR_KEY entry."""
     return [
-        c for c, v in judge_output.items()
+        c
+        for c, v in judge_output.items()
         if c != prompts.NEW_CHAR_KEY and v.get("same_person_as_target")
     ]
 
@@ -626,7 +696,7 @@ def char_update_history(
     registry: dict,
     target_id: str,
     model: str,
-    new_aliases_this_episode: list[str] = (),
+    new_aliases_this_episode: Sequence[str] = (),
 ) -> Result:
     """Per-target identity-change history entry. Output: `{new_history, reason}`.
     `new_history` is null when no identity change occurred.
